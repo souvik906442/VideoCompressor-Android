@@ -373,15 +373,8 @@ public class MainActivity extends AppCompatActivity {
         it.durMs = durMs;
         it.srcBps = (durMs > 0 && it.size > 0) ? it.size * 8000L / durMs : 0;
 
-        // open the video ourselves and hand ffmpeg a plain /proc/self/fd path (more robust than the saf: protocol)
-        String inArg = null;
         closeIn();
-        try {
-            inPfd = getContentResolver().openFileDescriptor(it.uri, "r");
-            if (inPfd != null) inArg = "/proc/self/fd/" + inPfd.getFd();
-        } catch (Exception ignored) {
-        }
-        if (inArg == null) inArg = FFmpegKitConfig.getSafParameterForRead(this, it.uri);
+        String inArg = FFmpegKitConfig.getSafParameterForRead(this, it.uri);
         if (inArg == null) {
             jobFailed(it, "Cannot open this video");
             return;
