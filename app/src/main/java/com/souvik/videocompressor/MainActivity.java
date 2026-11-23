@@ -82,7 +82,7 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout llFiles;
     private Button btnAdd, btnClear, btnStart, btnCancel;
     private RadioButton rbAudio;
-    private Spinner spQuality, spCodec, spRes, spRot;
+    private Spinner spQuality, spCodec, spRes, spRot, spSpeed;
     private CheckBox cbMute;
     private EditText etStart, etEnd;
     private ProgressBar progress;
@@ -101,6 +101,9 @@ public class MainActivity extends AppCompatActivity {
     // options captured at Start
     private boolean audioMode, mute, h265;
     private int resH, rotDeg;
+    private int speedMode;   // 0 = hardware encoder, 1 = x264 veryfast, 2 = x264 fast
+    private int qIdx;       // 0 high, 1 medium, 2 low
+    private boolean hwActive, triedFallback;
     private int crf;        // x264 quality: lower = better picture, bigger file
     private int audioBps;
     private long startMs, endMs;
@@ -161,6 +164,7 @@ public class MainActivity extends AppCompatActivity {
 
         spQuality = setupSpinner(R.id.spQuality, new String[]{"High", "Medium", "Low"}, 1);
         spCodec = setupSpinner(R.id.spCodec, new String[]{"H.264 (most compatible)", "H.265 (smaller)"}, 0);
+        spSpeed = setupSpinner(R.id.spSpeed, new String[]{"Hardware (fastest)", "Fast (software)", "Best compression (slow)"}, 0);
         spRes = setupSpinner(R.id.spRes, new String[]{"Original", "1080p", "720p", "480p", "360p"}, 0);
         spRot = setupSpinner(R.id.spRot, new String[]{"None", "90° right", "180°", "90° left"}, 0);
 
@@ -228,6 +232,7 @@ public class MainActivity extends AppCompatActivity {
         boolean video = !rbAudio.isChecked();
         spQuality.setEnabled(video);
         spCodec.setEnabled(video);
+        spSpeed.setEnabled(video);
         spRes.setEnabled(video);
         spRot.setEnabled(video);
         cbMute.setEnabled(video);
@@ -291,6 +296,8 @@ public class MainActivity extends AppCompatActivity {
         mute = cbMute.isChecked();
         h265 = spCodec.getSelectedItemPosition() == 1;
         int q = spQuality.getSelectedItemPosition();
+        qIdx = q;
+        speedMode = spSpeed.getSelectedItemPosition();
         crf = q == 0 ? 24 : (q == 1 ? 28 : 31);                  // constant-quality encoding (like the original app)
         audioBps = q == 0 ? 128_000 : (q == 1 ? 96_000 : 64_000);
         int[] heights = {0, 1080, 720, 480, 360};
@@ -342,6 +349,7 @@ public class MainActivity extends AppCompatActivity {
         }
         final Item it = items.get(index);
         it.status = "Starting…";
+        triedFallback = false;
         refresh(it);
         tJob = System.currentTimeMillis();
         tmpOut = new File(getCacheDir(), "out_" + System.nanoTime() + (audioMode ? ".m4a" : ".mp4"));
@@ -353,6 +361,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void buildAndStart(final Item it) {
+        hwActive = false;
         // --- duration of the source (for progress + a size cap)
         long durMs = 0;
         MediaMetadataRetriever r = new MediaMetadataRetriever();
@@ -417,35 +426,51 @@ public class MainActivity extends AppCompatActivity {
                 a.add("-vf");
                 a.add(android.text.TextUtils.join(",", vf));
             }
-            // the same recipe as the original app: x264, constant quality (CRF), preset fast
-            if (h265) {
+            hwActive = speedMode == 0 && !triedFallback;
+            if (hwActive) {
+                // phone's hardware encoder: very fast, bitrate-based (no CRF)
+                double f = qIdx == 0 ? 0.7 : (qIdx == 1 ? 0.5 : 0.35);
+                long vb = it.srcBps > 0 ? Math.max(300_000L, (long) ((it.srcBps - (mute ? 0 : audioBps)) * f)) : 2_000_000L;
+                if (h265) vb = (long) (vb * 0.7);
                 a.add("-c:v");
-                a.add("libx265");
-                a.add("-crf");
-                a.add(String.valueOf(crf + 2));
-                a.add("-preset");
-                a.add("fast");
-                a.add("-tag:v");
-                a.add("hvc1");
+                a.add(h265 ? "hevc_mediacodec" : "h264_mediacodec");
+                a.add("-b:v");
+                a.add(String.valueOf(vb));
+                if (h265) {
+                    a.add("-tag:v");
+                    a.add("hvc1");
+                }
             } else {
-                a.add("-c:v");
-                a.add("libx264");
-                a.add("-crf");
-                a.add(String.valueOf(crf));
-                a.add("-preset");
-                a.add("fast");
-                a.add("-profile:v");
-                a.add("high");
-            }
-            a.add("-pix_fmt");
-            a.add("yuv420p");
-            // safety net: never let the picture use more bits than the original did
-            if (it.srcBps > 0) {
-                long cap = Math.max(100_000L, (long) (it.srcBps * 0.85) - (mute ? 0 : audioBps));
-                a.add("-maxrate");
-                a.add(String.valueOf(cap));
-                a.add("-bufsize");
-                a.add(String.valueOf(cap * 2));
+                String preset = speedMode == 2 ? "fast" : "veryfast";
+                if (h265) {
+                    a.add("-c:v");
+                    a.add("libx265");
+                    a.add("-crf");
+                    a.add(String.valueOf(crf + 2));
+                    a.add("-preset");
+                    a.add(preset);
+                    a.add("-tag:v");
+                    a.add("hvc1");
+                } else {
+                    a.add("-c:v");
+                    a.add("libx264");
+                    a.add("-crf");
+                    a.add(String.valueOf(crf));
+                    a.add("-preset");
+                    a.add(preset);
+                    a.add("-profile:v");
+                    a.add("high");
+                }
+                a.add("-pix_fmt");
+                a.add("yuv420p");
+                // safety net: never let the picture use more bits than the original did
+                if (it.srcBps > 0) {
+                    long cap = Math.max(100_000L, (long) (it.srcBps * 0.85) - (mute ? 0 : audioBps));
+                    a.add("-maxrate");
+                    a.add(String.valueOf(cap));
+                    a.add("-bufsize");
+                    a.add(String.valueOf(cap * 2));
+                }
             }
             if (mute) {
                 a.add("-an");
@@ -467,6 +492,18 @@ public class MainActivity extends AppCompatActivity {
                     if (cancelled) return;
                     if (ReturnCode.isSuccess(done.getReturnCode())) {
                         jobDone(it);
+                    } else if (hwActive && !triedFallback) {
+                        // hardware encoder not usable here -> redo this file with the software encoder
+                        triedFallback = true;
+                        if (tmpOut != null) tmpOut.delete();
+                        tmpOut = new File(getCacheDir(), "out_" + System.nanoTime() + ".mp4");
+                        it.status = "Hardware encoder failed, using software…";
+                        refresh(it);
+                        try {
+                            buildAndStart(it);
+                        } catch (Throwable e) {
+                            jobFailed(it, "Error: " + e);
+                        }
                     } else {
                         jobFailed(it, "Failed: " + lastLine(done.getOutput()));
                     }
