@@ -37,6 +37,20 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.media3.common.Effect;
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.MimeTypes;
+import androidx.media3.effect.Presentation;
+import androidx.media3.effect.ScaleAndRotateTransformation;
+import androidx.media3.transformer.Composition;
+import androidx.media3.transformer.DefaultEncoderFactory;
+import androidx.media3.transformer.EditedMediaItem;
+import androidx.media3.transformer.Effects;
+import androidx.media3.transformer.ExportException;
+import androidx.media3.transformer.ExportResult;
+import androidx.media3.transformer.ProgressHolder;
+import androidx.media3.transformer.Transformer;
+import androidx.media3.transformer.VideoEncoderSettings;
 
 import com.arthenica.ffmpegkit.FFmpegKit;
 import com.arthenica.ffmpegkit.FFmpegKitConfig;
@@ -103,7 +117,8 @@ public class MainActivity extends AppCompatActivity {
     private int resH, rotDeg;
     private int speedMode;   // 0 = hardware encoder, 1 = x264 veryfast, 2 = x264 fast
     private int qIdx;       // 0 high, 1 medium, 2 low
-    private boolean hwActive, triedFallback;
+    private boolean triedFallback;
+    private Transformer transformer;   // hardware path (null when ffmpeg is used)
     private int crf;        // x264 quality: lower = better picture, bigger file
     private int audioBps;
     private long startMs, endMs;
@@ -332,6 +347,7 @@ public class MainActivity extends AppCompatActivity {
         if (!saving) {
             try {
                 if (session != null) FFmpegKit.cancel(session.getSessionId());
+                if (transformer != null) transformer.cancel();
             } catch (Exception ignored) {
             }
             if (index < items.size()) {
@@ -361,13 +377,22 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void buildAndStart(final Item it) {
-        hwActive = false;
+        transformer = null;
         // --- duration of the source (for progress + a size cap)
         long durMs = 0;
+        int srcW = 0, srcH = 0;
         MediaMetadataRetriever r = new MediaMetadataRetriever();
         try {
             r.setDataSource(this, it.uri);
             durMs = toLong(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION));
+            srcW = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH));
+            srcH = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT));
+            int rot0 = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION));
+            if (rot0 == 90 || rot0 == 270) {
+                int t = srcW;
+                srcW = srcH;
+                srcH = t;
+            }
         } catch (Exception ignored) {
         } finally {
             try {
@@ -382,6 +407,10 @@ public class MainActivity extends AppCompatActivity {
         it.durMs = durMs;
         it.srcBps = (durMs > 0 && it.size > 0) ? it.size * 8000L / durMs : 0;
 
+        if (!audioMode && speedMode == 0 && !triedFallback) {
+            startTransformer(it, srcW, srcH);
+            return;
+        }
         closeIn();
         String inArg = FFmpegKitConfig.getSafParameterForRead(this, it.uri);
         if (inArg == null) {
@@ -426,21 +455,6 @@ public class MainActivity extends AppCompatActivity {
                 a.add("-vf");
                 a.add(android.text.TextUtils.join(",", vf));
             }
-            hwActive = speedMode == 0 && !triedFallback;
-            if (hwActive) {
-                // phone's hardware encoder: very fast, bitrate-based (no CRF)
-                double f = qIdx == 0 ? 0.7 : (qIdx == 1 ? 0.5 : 0.35);
-                long vb = it.srcBps > 0 ? Math.max(300_000L, (long) ((it.srcBps - (mute ? 0 : audioBps)) * f)) : 2_000_000L;
-                if (h265) vb = (long) (vb * 0.7);
-                a.add("-c:v");
-                a.add(h265 ? "hevc_mediacodec" : "h264_mediacodec");
-                a.add("-b:v");
-                a.add(String.valueOf(vb));
-                if (h265) {
-                    a.add("-tag:v");
-                    a.add("hvc1");
-                }
-            } else {
                 String preset = speedMode == 2 ? "fast" : "veryfast";
                 if (h265) {
                     a.add("-c:v");
@@ -471,7 +485,6 @@ public class MainActivity extends AppCompatActivity {
                     a.add("-bufsize");
                     a.add(String.valueOf(cap * 2));
                 }
-            }
             if (mute) {
                 a.add("-an");
             } else {
@@ -492,18 +505,6 @@ public class MainActivity extends AppCompatActivity {
                     if (cancelled) return;
                     if (ReturnCode.isSuccess(done.getReturnCode())) {
                         jobDone(it);
-                    } else if (hwActive && !triedFallback) {
-                        // hardware encoder not usable here -> redo this file with the software encoder
-                        triedFallback = true;
-                        if (tmpOut != null) tmpOut.delete();
-                        tmpOut = new File(getCacheDir(), "out_" + System.nanoTime() + ".mp4");
-                        it.status = "Hardware encoder failed, using software…";
-                        refresh(it);
-                        try {
-                            buildAndStart(it);
-                        } catch (Throwable e) {
-                            jobFailed(it, "Error: " + e);
-                        }
                     } else {
                         jobFailed(it, "Failed: " + lastLine(done.getOutput()));
                     }
@@ -568,6 +569,69 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
+    /** Hardware transcode through Android's MediaCodec (Media3 Transformer). Falls back to ffmpeg on error. */
+    private void startTransformer(final Item it, int srcW, int srcH) {
+        int dispH = (rotDeg == 90 || rotDeg == 270) ? srcW : srcH;     // picture height after rotating
+        int target = dispH;
+        if (resH > 0 && dispH > 0) target = Math.min(dispH, resH);
+        double f = qIdx == 0 ? 0.8 : (qIdx == 1 ? 0.6 : 0.45);
+        long vb = it.srcBps > 0 ? Math.max(150_000L, (long) ((it.srcBps - (mute ? 0 : audioBps)) * f)) : 2_000_000L;
+        if (h265) vb = (long) (vb * 0.7);
+
+        VideoEncoderSettings vs = new VideoEncoderSettings.Builder().setBitrate((int) Math.min(vb, 50_000_000L)).build();
+        List<Effect> fx = new ArrayList<>();
+        if (rotDeg != 0) fx.add(new ScaleAndRotateTransformation.Builder().setRotationDegrees(-rotDeg).build());
+        if (target > 0) fx.add(Presentation.createForHeight(target));   // also makes sure the video is really re-encoded
+
+        MediaItem.Builder mb = new MediaItem.Builder().setUri(it.uri);
+        if (startMs > 0 || endMs > 0) {
+            MediaItem.ClippingConfiguration.Builder cb = new MediaItem.ClippingConfiguration.Builder();
+            cb.setStartPositionMs(startMs);
+            if (endMs > 0) cb.setEndPositionMs(endMs);
+            mb.setClippingConfiguration(cb.build());
+        }
+        EditedMediaItem em = new EditedMediaItem.Builder(mb.build())
+                .setRemoveAudio(mute)
+                .setEffects(new Effects(Collections.emptyList(), fx))
+                .build();
+
+        jobProgress = 0f;
+        session = null;
+        transformer = new Transformer.Builder(this)
+                .setVideoMimeType(h265 ? MimeTypes.VIDEO_H265 : MimeTypes.VIDEO_H264)
+                .setEncoderFactory(new DefaultEncoderFactory.Builder(this)
+                        .setRequestedVideoEncoderSettings(vs)
+                        .setEnableFallback(true)
+                        .build())
+                .addListener(new Transformer.Listener() {
+                    @Override
+                    public void onCompleted(Composition composition, ExportResult exportResult) {
+                        transformer = null;
+                        if (cancelled) return;
+                        jobDone(it);
+                    }
+
+                    @Override
+                    public void onError(Composition composition, ExportResult exportResult, ExportException e) {
+                        transformer = null;
+                        if (cancelled) return;
+                        // hardware path failed -> redo this file with ffmpeg (software)
+                        triedFallback = true;
+                        if (tmpOut != null) tmpOut.delete();
+                        tmpOut = new File(getCacheDir(), "out_" + System.nanoTime() + ".mp4");
+                        it.status = "Hardware failed (" + e.getErrorCodeName() + "), using software…";
+                        refresh(it);
+                        try {
+                            buildAndStart(it);
+                        } catch (Throwable t) {
+                            jobFailed(it, "Error: " + t);
+                        }
+                    }
+                })
+                .build();
+        transformer.start(em, tmpOut.getAbsolutePath());
+    }
+
     private void closeIn() {
         try {
             if (inPfd != null) inPfd.close();
@@ -613,7 +677,11 @@ public class MainActivity extends AppCompatActivity {
             if (index < items.size()) {
                 Item it = items.get(index);
                 int pct = 0;
-                if (!saving && session != null) {
+                if (!saving && transformer != null) {
+                    ProgressHolder ph = new ProgressHolder();
+                    if (transformer.getProgress(ph) == Transformer.PROGRESS_STATE_AVAILABLE) jobProgress = ph.progress / 100f;
+                }
+                if (!saving && (session != null || transformer != null)) {
                     pct = Math.max(0, Math.min(99, (int) (jobProgress * 100)));
                     it.status = pct + "%";
                     refresh(it);
@@ -840,6 +908,7 @@ public class MainActivity extends AppCompatActivity {
         handler.removeCallbacks(tick);
         try {
             if (session != null && running) FFmpegKit.cancel(session.getSessionId());
+            if (transformer != null) transformer.cancel();
         } catch (Exception ignored) {
         }
         io.shutdown();
