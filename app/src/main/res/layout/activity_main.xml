@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="14dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="What do you want to do?"
+            android:textSize="17sp"
+            android:textStyle="bold" />
+
+        <RadioGroup
+            android:id="@+id/rgMode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+            <RadioButton android:id="@+id/rbCompress" android:layout_width="wrap_content"
+                android:layout_height="wrap_content" android:checked="true" android:text="Compress" />
+            <RadioButton android:id="@+id/rbAudio" android:layout_width="wrap_content"
+                android:layout_height="wrap_content" android:layout_marginStart="16dp"
+                android:text="Video to audio (m4a)" />
+        </RadioGroup>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:orientation="horizontal">
+            <Button android:id="@+id/btnAdd" android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:text="Add videos" />
+            <Button android:id="@+id/btnClear" android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:text="Clear" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tvHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="Tap Add videos. Tap a file in the list to remove it."
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:id="@+id/llFiles"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:minHeight="90dp"
+            android:orientation="vertical" />
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:layout_marginTop="10dp" android:text="Quality" />
+        <Spinner android:id="@+id/spQuality" android:layout_width="match_parent" android:layout_height="wrap_content" />
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Codec" />
+        <Spinner android:id="@+id/spCodec" android:layout_width="match_parent" android:layout_height="wrap_content" />
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Resolution" />
+        <Spinner android:id="@+id/spRes" android:layout_width="match_parent" android:layout_height="wrap_content" />
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Rotate" />
+        <Spinner android:id="@+id/spRot" android:layout_width="match_parent" android:layout_height="wrap_content" />
+
+        <CheckBox android:id="@+id/cbMute" android:layout_width="wrap_content"
+            android:layout_height="wrap_content" android:text="Remove audio" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Trim from" />
+            <EditText android:id="@+id/etStart" android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:hint="0:00" android:inputType="text" />
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="to" />
+            <EditText android:id="@+id/etEnd" android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:hint="end" android:inputType="text" />
+        </LinearLayout>
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="(e.g. 1:30, empty = whole video)" android:textSize="12sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:orientation="horizontal">
+            <Button android:id="@+id/btnStart" android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:text="Start" />
+            <Button android:id="@+id/btnCancel" android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:enabled="false" android:text="Cancel" />
+        </LinearLayout>
+
+        <ProgressBar
+            android:id="@+id/progress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:max="1000" />
+
+        <TextView
+            android:id="@+id/tvStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="Add videos, choose options, press Start" />
+    </LinearLayout>
+</ScrollView>

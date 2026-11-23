@@ -1,0 +1,529 @@
+package com.souvik.videocompressor;
+
+import android.content.ContentResolver;
+import android.content.ContentValues;
+import android.content.Intent;
+import android.database.Cursor;
+import android.media.MediaMetadataRetriever;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.MediaStore;
+import android.provider.OpenableColumns;
+import android.view.View;
+import android.view.WindowManager;
+import android.widget.ArrayAdapter;
+import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.ProgressBar;
+import android.widget.RadioButton;
+import android.widget.Spinner;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.media3.common.Effect;
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.MimeTypes;
+import androidx.media3.common.audio.AudioProcessor;
+import androidx.media3.effect.Presentation;
+import androidx.media3.effect.ScaleAndRotateTransformation;
+import androidx.media3.transformer.Composition;
+import androidx.media3.transformer.DefaultEncoderFactory;
+import androidx.media3.transformer.EditedMediaItem;
+import androidx.media3.transformer.Effects;
+import androidx.media3.transformer.ExportException;
+import androidx.media3.transformer.ExportResult;
+import androidx.media3.transformer.ProgressHolder;
+import androidx.media3.transformer.Transformer;
+import androidx.media3.transformer.VideoEncoderSettings;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+/**
+ * Video Compressor for Android.
+ *
+ * Videos are chosen with the system picker (no storage permission needed), so the list can never
+ * be "empty because permission/loading raced". The screen is never recreated by split-screen or
+ * rotation (see configChanges in the manifest), so the queue is always kept.
+ */
+public class MainActivity extends AppCompatActivity {
+
+    static class Item {
+        Uri uri;
+        String name;
+        long size;
+        String status = "Queued";
+        TextView tv;
+    }
+
+    private final List<Item> items = new ArrayList<>();
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final ExecutorService io = Executors.newSingleThreadExecutor();
+
+    private LinearLayout llFiles;
+    private Button btnAdd, btnClear, btnStart, btnCancel;
+    private RadioButton rbAudio;
+    private Spinner spQuality, spCodec, spRes, spRot;
+    private CheckBox cbMute;
+    private EditText etStart, etEnd;
+    private ProgressBar progress;
+    private TextView tvStatus;
+
+    // run state
+    private Transformer transformer;
+    private boolean running, cancelled, saving;
+    private int index, okCount;
+    private long t0, tJob;
+    private File tmpOut;
+    // options captured at Start
+    private boolean audioMode, mute, h265;
+    private int resH, rotDeg;
+    private double qFactor;
+    private long startMs, endMs;
+
+    private final ActivityResultLauncher<String[]> picker = registerForActivityResult(
+            new ActivityResultContracts.OpenMultipleDocuments(),
+            uris -> {
+                if (uris != null && !uris.isEmpty()) addUris(uris);
+            });
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        llFiles = findViewById(R.id.llFiles);
+        btnAdd = findViewById(R.id.btnAdd);
+        btnClear = findViewById(R.id.btnClear);
+        btnStart = findViewById(R.id.btnStart);
+        btnCancel = findViewById(R.id.btnCancel);
+        rbAudio = findViewById(R.id.rbAudio);
+        cbMute = findViewById(R.id.cbMute);
+        etStart = findViewById(R.id.etStart);
+        etEnd = findViewById(R.id.etEnd);
+        progress = findViewById(R.id.progress);
+        tvStatus = findViewById(R.id.tvStatus);
+
+        spQuality = setupSpinner(R.id.spQuality, new String[]{"High", "Medium", "Low"}, 1);
+        spCodec = setupSpinner(R.id.spCodec, new String[]{"H.264 (most compatible)", "H.265 (smaller)"}, 0);
+        spRes = setupSpinner(R.id.spRes, new String[]{"Original", "1080p", "720p", "480p", "360p"}, 0);
+        spRot = setupSpinner(R.id.spRot, new String[]{"None", "90° right", "180°", "90° left"}, 0);
+
+        btnAdd.setOnClickListener(v -> picker.launch(new String[]{"video/*"}));
+        btnClear.setOnClickListener(v -> {
+            if (running) return;
+            items.clear();
+            llFiles.removeAllViews();
+        });
+        btnStart.setOnClickListener(v -> start());
+        btnCancel.setOnClickListener(v -> cancelAll());
+        ((android.widget.RadioGroup) findViewById(R.id.rgMode)).setOnCheckedChangeListener(
+                (g, id) -> updateModeUi());
+
+        handleIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        handleIntent(intent);
+    }
+
+    @SuppressWarnings("deprecation")
+    private void handleIntent(Intent i) {
+        if (i == null || i.getAction() == null) return;
+        List<Uri> uris = new ArrayList<>();
+        if (Intent.ACTION_SEND.equals(i.getAction())) {
+            Uri u = i.getParcelableExtra(Intent.EXTRA_STREAM);
+            if (u != null) uris.add(u);
+        } else if (Intent.ACTION_SEND_MULTIPLE.equals(i.getAction())) {
+            ArrayList<Uri> l = i.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
+            if (l != null) uris.addAll(l);
+        }
+        if (!uris.isEmpty()) addUris(uris);
+    }
+
+    private Spinner setupSpinner(int id, String[] values, int selected) {
+        Spinner s = findViewById(id);
+        ArrayAdapter<String> a = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, values);
+        a.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        s.setAdapter(a);
+        s.setSelection(selected);
+        return s;
+    }
+
+    private void updateModeUi() {
+        boolean video = !rbAudio.isChecked();
+        spQuality.setEnabled(video);
+        spCodec.setEnabled(video);
+        spRes.setEnabled(video);
+        spRot.setEnabled(video);
+        cbMute.setEnabled(video);
+    }
+
+    // ------------------------------------------------------------ file list
+    private void addUris(List<Uri> uris) {
+        for (Uri u : uris) {
+            boolean dup = false;
+            for (Item e : items) if (e.uri.equals(u)) dup = true;
+            if (dup) continue;
+            final Item it = new Item();
+            it.uri = u;
+            it.name = "video";
+            it.size = 0;
+            try (Cursor c = getContentResolver().query(u, null, null, null, null)) {
+                if (c != null && c.moveToFirst()) {
+                    int n = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                    int s = c.getColumnIndex(OpenableColumns.SIZE);
+                    if (n >= 0 && c.getString(n) != null) it.name = c.getString(n);
+                    if (s >= 0) it.size = c.getLong(s);
+                }
+            } catch (Exception ignored) {
+            }
+            it.tv = new TextView(this);
+            it.tv.setPadding(0, 12, 0, 12);
+            it.tv.setOnClickListener(v -> {
+                if (running) return;
+                items.remove(it);
+                llFiles.removeView(it.tv);
+            });
+            llFiles.addView(it.tv);
+            refresh(it);
+            items.add(it);
+        }
+    }
+
+    private void refresh(Item it) {
+        it.tv.setText(it.name + "\n" + human(it.size) + "  •  " + it.status);
+    }
+
+    // ------------------------------------------------------------- running
+    private void start() {
+        if (running) return;
+        if (items.isEmpty()) {
+            Toast.makeText(this, "Add at least one video first.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            startMs = parseTime(etStart.getText().toString());
+            endMs = parseTime(etEnd.getText().toString());
+        } catch (Exception e) {
+            Toast.makeText(this, "Trim times must look like 90 or 1:30 or 0:01:30.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (endMs > 0 && endMs <= startMs) {
+            Toast.makeText(this, "Trim end must be after trim start.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        audioMode = rbAudio.isChecked();
+        mute = cbMute.isChecked();
+        h265 = spCodec.getSelectedItemPosition() == 1;
+        int q = spQuality.getSelectedItemPosition();
+        qFactor = q == 0 ? 0.75 : (q == 1 ? 0.5 : 0.3);
+        int[] heights = {0, 1080, 720, 480, 360};
+        resH = heights[spRes.getSelectedItemPosition()];
+        int[] rots = {0, 270, 180, 90};   // Media3 rotates counter-clockwise
+        rotDeg = rots[spRot.getSelectedItemPosition()];
+
+        for (Item it : items) {
+            it.status = "Queued";
+            refresh(it);
+        }
+        cancelled = false;
+        saving = false;
+        running = true;
+        index = 0;
+        okCount = 0;
+        t0 = System.currentTimeMillis();
+        progress.setProgress(0);
+        btnStart.setEnabled(false);
+        btnCancel.setEnabled(true);
+        btnAdd.setEnabled(false);
+        btnClear.setEnabled(false);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        handler.post(tick);
+        startNext();
+    }
+
+    private void cancelAll() {
+        if (!running) return;
+        cancelled = true;
+        tvStatus.setText("Cancelling…");
+        if (!saving) {
+            try {
+                if (transformer != null) transformer.cancel();
+            } catch (Exception ignored) {
+            }
+            if (index < items.size()) {
+                items.get(index).status = "Cancelled";
+                refresh(items.get(index));
+            }
+            finishAll();
+        }
+    }
+
+    private void startNext() {
+        if (cancelled || index >= items.size()) {
+            finishAll();
+            return;
+        }
+        final Item it = items.get(index);
+        it.status = "Starting…";
+        refresh(it);
+        tJob = System.currentTimeMillis();
+        tmpOut = new File(getCacheDir(), "out_" + System.nanoTime() + (audioMode ? ".m4a" : ".mp4"));
+        try {
+            buildAndStart(it);
+        } catch (Exception e) {
+            jobFailed(it, String.valueOf(e.getMessage()));
+        }
+    }
+
+    private void buildAndStart(final Item it) {
+        // --- read source info (for a sensible target bitrate)
+        int w = 0, h = 0, rot = 0;
+        long br = 0;
+        MediaMetadataRetriever r = new MediaMetadataRetriever();
+        try {
+            r.setDataSource(this, it.uri);
+            w = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH));
+            h = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT));
+            rot = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION));
+            br = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE));
+        } catch (Exception ignored) {
+        } finally {
+            try {
+                r.release();
+            } catch (Exception ignored) {
+            }
+        }
+        int dispH = (rot == 90 || rot == 270) ? w : h;     // height as seen by the viewer
+        if (rotDeg == 90 || rotDeg == 270) dispH = (rot == 90 || rot == 270) ? h : w;
+
+        MediaItem.Builder mib = new MediaItem.Builder().setUri(it.uri);
+        if (startMs > 0 || endMs > 0) {
+            MediaItem.ClippingConfiguration.Builder cc = new MediaItem.ClippingConfiguration.Builder();
+            if (startMs > 0) cc.setStartPositionMs(startMs);
+            if (endMs > 0) cc.setEndPositionMs(endMs);
+            mib.setClippingConfiguration(cc.build());
+        }
+
+        EditedMediaItem.Builder emb = new EditedMediaItem.Builder(mib.build());
+        Transformer.Builder tb = new Transformer.Builder(this).addListener(new Transformer.Listener() {
+            @Override
+            public void onCompleted(Composition composition, ExportResult exportResult) {
+                if (!cancelled) jobDone(it);
+            }
+
+            @Override
+            public void onError(Composition composition, ExportResult exportResult, ExportException e) {
+                if (!cancelled) jobFailed(it, "Failed: " + e.getErrorCodeName());
+            }
+        });
+
+        if (audioMode) {
+            emb.setRemoveVideo(true);
+            tb.setAudioMimeType(MimeTypes.AUDIO_AAC);
+        } else {
+            List<Effect> fx = new ArrayList<>();
+            if (rotDeg != 0) {
+                fx.add(new ScaleAndRotateTransformation.Builder().setRotationDegrees(rotDeg).build());
+            }
+            int outH = dispH;
+            if (resH > 0 && dispH > resH) {
+                fx.add(Presentation.createForHeight(resH));
+                outH = resH;
+            }
+            emb.setEffects(new Effects(Collections.<AudioProcessor>emptyList(), fx));
+            if (mute) emb.setRemoveAudio(true);
+
+            double base = br > 0 ? br : 2_500_000.0;
+            double scale = dispH > 0 ? Math.pow((double) outH / dispH, 2) : 1.0;
+            double bps = base * qFactor * scale * (h265 ? 0.7 : 1.0);
+            int bitrate = (int) Math.max(250_000, Math.min(bps, 50_000_000));
+
+            tb.setVideoMimeType(h265 ? MimeTypes.VIDEO_H265 : MimeTypes.VIDEO_H264);
+            tb.setEncoderFactory(new DefaultEncoderFactory.Builder(this)
+                    .setRequestedVideoEncoderSettings(
+                            new VideoEncoderSettings.Builder().setBitrate(bitrate).build())
+                    .build());
+        }
+        transformer = tb.build();
+        transformer.start(emb.build(), tmpOut.getAbsolutePath());
+    }
+
+    private void jobDone(final Item it) {
+        saving = true;
+        it.status = "Saving…";
+        refresh(it);
+        final File src = tmpOut;
+        final boolean audio = audioMode;
+        io.execute(() -> {
+            long outSize = -1;
+            String err = null;
+            try {
+                outSize = saveToMediaStore(src, it.name, audio);
+            } catch (Exception e) {
+                err = String.valueOf(e.getMessage());
+            }
+            final long fOut = outSize;
+            final String fErr = err;
+            handler.post(() -> {
+                saving = false;
+                src.delete();
+                if (fErr == null) {
+                    okCount++;
+                    String text = "Done - " + human(fOut);
+                    if (!audio && it.size > 0 && startMs == 0 && endMs == 0) {
+                        long pct = (fOut - it.size) * 100 / it.size;
+                        text += String.format(Locale.US, " (%+d%%)", pct);
+                    }
+                    text += " in " + hms((System.currentTimeMillis() - tJob) / 1000);
+                    it.status = text;
+                } else {
+                    it.status = "Could not save: " + fErr;
+                }
+                refresh(it);
+                index++;
+                startNext();
+            });
+        });
+    }
+
+    private void jobFailed(Item it, String msg) {
+        if (tmpOut != null) tmpOut.delete();
+        it.status = msg;
+        refresh(it);
+        index++;
+        startNext();
+    }
+
+    private void finishAll() {
+        running = false;
+        handler.removeCallbacks(tick);
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        btnStart.setEnabled(true);
+        btnCancel.setEnabled(false);
+        btnAdd.setEnabled(true);
+        btnClear.setEnabled(true);
+        String total = hms((System.currentTimeMillis() - t0) / 1000);
+        if (cancelled) {
+            tvStatus.setText("Cancelled  -  time " + total);
+        } else {
+            progress.setProgress(1000);
+            tvStatus.setText("Finished: " + okCount + " of " + items.size() + " done  -  total time " + total
+                    + "\nSaved in " + (audioMode ? "Music" : "Movies") + "/VideoCompressor");
+        }
+    }
+
+    /** Updates progress + elapsed time (hh:mm:ss) twice a second while running. */
+    private final Runnable tick = new Runnable() {
+        @Override
+        public void run() {
+            if (!running) return;
+            if (index < items.size()) {
+                Item it = items.get(index);
+                int pct = 0;
+                if (!saving && transformer != null) {
+                    ProgressHolder ph = new ProgressHolder();
+                    if (transformer.getProgress(ph) == Transformer.PROGRESS_STATE_AVAILABLE) pct = ph.progress;
+                    it.status = pct + "%";
+                    refresh(it);
+                }
+                progress.setProgress((int) ((index + pct / 100f) / items.size() * 1000));
+                tvStatus.setText(String.format(Locale.US, "[%d/%d] %s    Elapsed %s",
+                        index + 1, items.size(), it.name, hms((System.currentTimeMillis() - t0) / 1000)));
+            }
+            handler.postDelayed(this, 500);
+        }
+    };
+
+    // ------------------------------------------------------------- helpers
+    private long saveToMediaStore(File src, String sourceName, boolean audio) throws Exception {
+        String base = sourceName;
+        int dot = base.lastIndexOf('.');
+        if (dot > 0) base = base.substring(0, dot);
+        String outName = audio ? base + ".m4a" : base + "_compressed.mp4";
+
+        ContentResolver cr = getContentResolver();
+        ContentValues cv = new ContentValues();
+        cv.put(MediaStore.MediaColumns.DISPLAY_NAME, outName);
+        cv.put(MediaStore.MediaColumns.MIME_TYPE, audio ? "audio/mp4" : "video/mp4");
+        cv.put(MediaStore.MediaColumns.RELATIVE_PATH,
+                audio ? "Music/VideoCompressor" : "Movies/VideoCompressor");
+        cv.put(MediaStore.MediaColumns.IS_PENDING, 1);
+        Uri collection = audio
+                ? MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                : MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+        Uri dst = cr.insert(collection, cv);
+        if (dst == null) throw new Exception("MediaStore insert failed");
+        try (InputStream in = new FileInputStream(src); OutputStream out = cr.openOutputStream(dst)) {
+            if (out == null) throw new Exception("cannot open output");
+            byte[] buf = new byte[256 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        } catch (Exception e) {
+            cr.delete(dst, null, null);
+            throw e;
+        }
+        ContentValues done = new ContentValues();
+        done.put(MediaStore.MediaColumns.IS_PENDING, 0);
+        cr.update(dst, done, null, null);
+        return src.length();
+    }
+
+    private static int toInt(String s) {
+        try {
+            return s == null ? 0 : Integer.parseInt(s.trim());
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private static long parseTime(String s) {
+        s = s.trim();
+        if (s.isEmpty()) return 0;
+        double t = 0;
+        for (String p : s.split(":")) t = t * 60 + Double.parseDouble(p.trim());
+        return (long) (t * 1000);
+    }
+
+    static String hms(long sec) {
+        return String.format(Locale.US, "%02d:%02d:%02d", sec / 3600, sec % 3600 / 60, sec % 60);
+    }
+
+    static String human(long b) {
+        if (b < 1024) return b + " B";
+        double k = b / 1024.0;
+        if (k < 1024) return String.format(Locale.US, "%.1f KB", k);
+        double m = k / 1024;
+        if (m < 1024) return String.format(Locale.US, "%.1f MB", m);
+        return String.format(Locale.US, "%.2f GB", m / 1024);
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        handler.removeCallbacks(tick);
+        try {
+            if (transformer != null && running) transformer.cancel();
+        } catch (Exception ignored) {
+        }
+        io.shutdown();
+    }
+}
