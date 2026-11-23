@@ -35,8 +35,10 @@ import androidx.media3.common.Effect;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.MimeTypes;
 import androidx.media3.common.audio.AudioProcessor;
+import androidx.media3.common.audio.SonicAudioProcessor;
 import androidx.media3.effect.Presentation;
 import androidx.media3.effect.ScaleAndRotateTransformation;
+import androidx.media3.transformer.AudioEncoderSettings;
 import androidx.media3.transformer.Composition;
 import androidx.media3.transformer.DefaultEncoderFactory;
 import androidx.media3.transformer.EditedMediaItem;
@@ -100,6 +102,7 @@ public class MainActivity extends AppCompatActivity {
     private boolean audioMode, mute, h265;
     private int resH, rotDeg;
     private double qFactor;
+    private int audioBps;
     private long startMs, endMs;
 
     private final ActivityResultLauncher<String[]> picker = registerForActivityResult(
@@ -286,7 +289,8 @@ public class MainActivity extends AppCompatActivity {
         mute = cbMute.isChecked();
         h265 = spCodec.getSelectedItemPosition() == 1;
         int q = spQuality.getSelectedItemPosition();
-        qFactor = q == 0 ? 0.75 : (q == 1 ? 0.5 : 0.3);
+        qFactor = q == 0 ? 0.6 : (q == 1 ? 0.4 : 0.25);        // share of the source VIDEO bitrate
+        audioBps = q == 0 ? 96_000 : (q == 1 ? 64_000 : 48_000);
         int[] heights = {0, 1080, 720, 480, 360};
         resH = heights[spRes.getSelectedItemPosition()];
         int[] rots = {0, 270, 180, 90};   // Media3 rotates counter-clockwise
@@ -401,17 +405,22 @@ public class MainActivity extends AppCompatActivity {
                 fx.add(Presentation.createForHeight(resH));
                 outH = resH;
             }
-            emb.setEffects(new Effects(Collections.<AudioProcessor>emptyList(), fx));
+            // Resampling to 32 kHz forces the audio to be re-encoded (at a low bitrate) instead of copied
+            SonicAudioProcessor sonic = new SonicAudioProcessor();
+            sonic.setOutputSampleRateHz(32000);
+            emb.setEffects(new Effects(Collections.<AudioProcessor>singletonList(sonic), fx));
             if (mute) emb.setRemoveAudio(true);
 
-            double base = br > 0 ? br : 2_500_000.0;
+            double audioEst = Math.min(128_000, br * 0.25);          // audio part of the source bitrate
+            double base = br > 0 ? Math.max(br - audioEst, 150_000) : 2_000_000.0;   // video part
             double scale = dispH > 0 ? Math.pow((double) outH / dispH, 2) : 1.0;
             double bps = base * qFactor * scale * (h265 ? 0.7 : 1.0);
-            if (br > 0) bps = Math.min(bps, br);          // never ask for more than the source had
-            int bitrate = (int) Math.max(200_000, Math.min(bps, 50_000_000));
+            int bitrate = (int) Math.max(120_000, Math.min(bps, 50_000_000));
 
             tb.setVideoMimeType(h265 ? MimeTypes.VIDEO_H265 : MimeTypes.VIDEO_H264);
             tb.setEncoderFactory(new DefaultEncoderFactory.Builder(this)
+                    .setRequestedAudioEncoderSettings(
+                            new AudioEncoderSettings.Builder().setBitrate(audioBps).build())
                     .setRequestedVideoEncoderSettings(
                             new VideoEncoderSettings.Builder()
                                     .setBitrate(bitrate)
