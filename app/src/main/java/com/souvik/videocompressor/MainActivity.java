@@ -1,6 +1,10 @@
 package com.souvik.videocompressor;
 
+import android.app.ApplicationExitInfo;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.ContentResolver;
+import android.content.Context;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -8,9 +12,11 @@ import android.content.UriPermission;
 import android.database.Cursor;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.ParcelFileDescriptor;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
@@ -29,6 +35,7 @@ import android.widget.Toast;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 
 import com.arthenica.ffmpegkit.FFmpegKit;
@@ -36,10 +43,13 @@ import com.arthenica.ffmpegkit.FFmpegKitConfig;
 import com.arthenica.ffmpegkit.FFmpegSession;
 import com.arthenica.ffmpegkit.ReturnCode;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -87,6 +97,7 @@ public class MainActivity extends AppCompatActivity {
     private int index, okCount;
     private long t0, tJob;
     private File tmpOut;
+    private ParcelFileDescriptor inPfd;   // input kept open while ffmpeg reads it
     // options captured at Start
     private boolean audioMode, mute, h265;
     private int resH, rotDeg;
@@ -116,6 +127,7 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        installCrashLogger();
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
@@ -164,6 +176,7 @@ public class MainActivity extends AppCompatActivity {
                 (g, id) -> updateModeUi());
 
         handleIntent(getIntent());
+        showLastCrash();
     }
 
     @Override
@@ -334,8 +347,8 @@ public class MainActivity extends AppCompatActivity {
         tmpOut = new File(getCacheDir(), "out_" + System.nanoTime() + (audioMode ? ".m4a" : ".mp4"));
         try {
             buildAndStart(it);
-        } catch (Exception e) {
-            jobFailed(it, String.valueOf(e.getMessage()));
+        } catch (Throwable e) {   // includes UnsatisfiedLinkError etc. from the ffmpeg native library
+            jobFailed(it, "Error: " + e);
         }
     }
 
@@ -360,7 +373,15 @@ public class MainActivity extends AppCompatActivity {
         it.durMs = durMs;
         it.srcBps = (durMs > 0 && it.size > 0) ? it.size * 8000L / durMs : 0;
 
-        String inArg = FFmpegKitConfig.getSafParameterForRead(this, it.uri);
+        // open the video ourselves and hand ffmpeg a plain /proc/self/fd path (more robust than the saf: protocol)
+        String inArg = null;
+        closeIn();
+        try {
+            inPfd = getContentResolver().openFileDescriptor(it.uri, "r");
+            if (inPfd != null) inArg = "/proc/self/fd/" + inPfd.getFd();
+        } catch (Exception ignored) {
+        }
+        if (inArg == null) inArg = FFmpegKitConfig.getSafParameterForRead(this, it.uri);
         if (inArg == null) {
             jobFailed(it, "Cannot open this video");
             return;
@@ -449,6 +470,7 @@ public class MainActivity extends AppCompatActivity {
         jobProgress = 0f;
         session = FFmpegKit.executeWithArgumentsAsync(a.toArray(new String[0]),
                 done -> handler.post(() -> {
+                    closeIn();
                     if (cancelled) return;
                     if (ReturnCode.isSuccess(done.getReturnCode())) {
                         jobDone(it);
@@ -516,7 +538,16 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
+    private void closeIn() {
+        try {
+            if (inPfd != null) inPfd.close();
+        } catch (Exception ignored) {
+        }
+        inPfd = null;
+    }
+
     private void jobFailed(Item it, String msg) {
+        closeIn();
         if (tmpOut != null) tmpOut.delete();
         it.status = msg;
         refresh(it);
@@ -669,6 +700,108 @@ public class MainActivity extends AppCompatActivity {
         double m = k / 1024;
         if (m < 1024) return String.format(Locale.US, "%.1f MB", m);
         return String.format(Locale.US, "%.2f GB", m / 1024);
+    }
+
+    // ------------------------------------------------------------- crash report
+    private File crashFile() {
+        return new File(getFilesDir(), "last_crash.txt");
+    }
+
+    /** Java crashes: save the stack trace so the next launch can show it. */
+    private void installCrashLogger() {
+        final Thread.UncaughtExceptionHandler old = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+            try {
+                StringWriter sw = new StringWriter();
+                e.printStackTrace(new PrintWriter(sw));
+                java.io.FileWriter fw = new java.io.FileWriter(crashFile());
+                fw.write("Java crash on thread " + t.getName() + "\n" + sw);
+                fw.close();
+            } catch (Throwable ignored) {
+            }
+            if (old != null) old.uncaughtException(t, e);
+        });
+    }
+
+    /** On launch: show the saved Java crash, or why the system says the last run died (native crash etc.). */
+    private void showLastCrash() {
+        String report = null;
+        try {
+            File f = crashFile();
+            if (f.exists()) {
+                try (FileInputStream in = new FileInputStream(f)) {
+                    ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                    byte[] b = new byte[4096];
+                    int k;
+                    while ((k = in.read(b)) > 0) bo.write(b, 0, k);
+                    report = bo.toString("UTF-8");
+                }
+                f.delete();
+            }
+        } catch (Throwable ignored) {
+        }
+        if (report == null && Build.VERSION.SDK_INT >= 30) {
+            try {
+                android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+                List<ApplicationExitInfo> l = am.getHistoricalProcessExitReasons(getPackageName(), 0, 1);
+                if (!l.isEmpty()) {
+                    ApplicationExitInfo e = l.get(0);
+                    long last = prefs.getLong("last_exit_ts", 0);
+                    int r = e.getReason();
+                    boolean bad = r == ApplicationExitInfo.REASON_CRASH_NATIVE || r == ApplicationExitInfo.REASON_CRASH
+                            || r == ApplicationExitInfo.REASON_ANR || r == ApplicationExitInfo.REASON_SIGNALED
+                            || r == ApplicationExitInfo.REASON_LOW_MEMORY || r == ApplicationExitInfo.REASON_INITIALIZATION_FAILURE;
+                    if (bad && e.getTimestamp() > last) {
+                        StringBuilder sb = new StringBuilder("Last run ended with reason code " + r
+                                + " (" + e.getDescription() + "), status " + e.getStatus() + "\n");
+                        if (r == ApplicationExitInfo.REASON_CRASH_NATIVE) {
+                            try (InputStream in = e.getTraceInputStream()) {
+                                if (in != null) {
+                                    // tombstone is binary protobuf: pull out the readable text (library names, signal)
+                                    ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                                    byte[] b = new byte[4096];
+                                    int k;
+                                    while ((k = in.read(b)) > 0 && bo.size() < 400_000) bo.write(b, 0, k);
+                                    byte[] d = bo.toByteArray();
+                                    StringBuilder run = new StringBuilder();
+                                    int lines = 0;
+                                    for (int i = 0; i <= d.length && lines < 40; i++) {
+                                        int c = i < d.length ? d[i] & 0xff : 0;
+                                        if (c >= 32 && c < 127) {
+                                            run.append((char) c);
+                                        } else {
+                                            String x = run.toString();
+                                            if (x.length() >= 8 && (x.contains(".so") || x.contains("SIG") || x.contains("abort")
+                                                    || x.contains("Abort") || x.contains("ffmpeg") || x.contains("Fatal"))) {
+                                                sb.append(x).append('\n');
+                                                lines++;
+                                            }
+                                            run.setLength(0);
+                                        }
+                                    }
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                        report = sb.toString();
+                    }
+                    prefs.edit().putLong("last_exit_ts", e.getTimestamp()).apply();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (report == null) return;
+        final String text = report;
+        new AlertDialog.Builder(this)
+                .setTitle("App crashed last time")
+                .setMessage(text)
+                .setPositiveButton("Copy", (d, w) -> {
+                    ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                    cm.setPrimaryClip(ClipData.newPlainText("crash", text));
+                    Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Close", null)
+                .show();
     }
 
     @Override
