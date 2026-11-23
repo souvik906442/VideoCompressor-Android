@@ -75,6 +75,7 @@ public class MainActivity extends AppCompatActivity {
         long size;
         String status = "Queued";
         TextView tv;
+        long durMs, srcBps, tgtBps;   // for the "source / target / result" bitrate report
     }
 
     private final List<Item> items = new ArrayList<>();
@@ -353,7 +354,8 @@ public class MainActivity extends AppCompatActivity {
     private void buildAndStart(final Item it) {
         // --- read source info (for a sensible target bitrate)
         int w = 0, h = 0, rot = 0;
-        long br = 0;
+        long br = 0, durMs = 0;
+        int fps = 0;
         MediaMetadataRetriever r = new MediaMetadataRetriever();
         try {
             r.setDataSource(this, it.uri);
@@ -361,6 +363,8 @@ public class MainActivity extends AppCompatActivity {
             h = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT));
             rot = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION));
             br = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE));
+            durMs = toLong(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION));
+            fps = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE));
         } catch (Exception ignored) {
         } finally {
             try {
@@ -370,6 +374,8 @@ public class MainActivity extends AppCompatActivity {
         }
         int dispH = (rot == 90 || rot == 270) ? w : h;     // height as seen by the viewer
         if (rotDeg == 90 || rotDeg == 270) dispH = (rot == 90 || rot == 270) ? h : w;
+        int dispW = (rot == 90 || rot == 270) ? h : w;     // width as seen by the viewer
+        if (rotDeg == 90 || rotDeg == 270) dispW = (rot == 90 || rot == 270) ? w : h;
 
         MediaItem.Builder mib = new MediaItem.Builder().setUri(it.uri);
         if (startMs > 0 || endMs > 0) {
@@ -411,11 +417,35 @@ public class MainActivity extends AppCompatActivity {
             emb.setEffects(new Effects(Collections.<AudioProcessor>singletonList(sonic), fx));
             if (mute) emb.setRemoveAudio(true);
 
-            double audioEst = Math.min(128_000, br * 0.25);          // audio part of the source bitrate
-            double base = br > 0 ? Math.max(br - audioEst, 150_000) : 2_000_000.0;   // video part
+            // Real average bitrate of the file (size / duration). The "bitrate" tag in the metadata is
+            // often missing or wrong, which made the old guess (2 Mbps) far too high for small files.
+            long srcBps = (durMs > 0 && it.size > 0) ? it.size * 8000L / durMs : br;
+            if (srcBps <= 0) srcBps = 2_000_000L;
+            double audioEst = Math.min(128_000, srcBps * 0.25);       // audio part of the source bitrate
+            double base = Math.max(srcBps - audioEst, 100_000);         // video part
             double scale = dispH > 0 ? Math.pow((double) outH / dispH, 2) : 1.0;
             double bps = base * qFactor * scale * (h265 ? 0.7 : 1.0);
             int bitrate = (int) Math.max(120_000, Math.min(bps, 50_000_000));
+            it.durMs = durMs;
+            it.srcBps = srcBps;
+            it.tgtBps = bitrate;
+
+            // A phone's hardware encoder cannot hold a very low bitrate for a big picture: it quietly
+            // produces MORE than asked. Estimate that, and don't waste minutes when the file is already
+            // as small as this picture size allows.
+            double fpsUse = fps > 0 ? Math.min(fps, 30) : 30;
+            double outW = dispH > 0 ? (double) dispW * outH / dispH : 0;
+            double floorBps = outW * outH * fpsUse * (h265 ? 0.03 : 0.045);
+            long estTotal = (long) ((Math.max(bitrate, floorBps) + (mute ? 0 : audioBps)) * durMs / 8000.0);
+            boolean plainCompress = rotDeg == 0 && !mute && startMs == 0 && endMs == 0;
+            if (durMs > 0 && it.size > 0 && plainCompress && estTotal >= it.size * 0.9) {
+                it.status = "Skipped - already very small (about " + (srcBps / 1000) + " kbps). "
+                        + "Compressing again would not make it smaller. Try a lower resolution (e.g. 480p).";
+                refresh(it);
+                index++;
+                startNext();
+                return;
+            }
 
             tb.setVideoMimeType(h265 ? MimeTypes.VIDEO_H265 : MimeTypes.VIDEO_H264);
             tb.setEncoderFactory(new DefaultEncoderFactory.Builder(this)
@@ -441,7 +471,12 @@ public class MainActivity extends AppCompatActivity {
         if (!audio && startMs == 0 && endMs == 0 && it.size > 0 && src.length() >= it.size) {
             long big = src.length();
             src.delete();
-            it.status = "Skipped - result " + human(big) + " is not smaller than the original";
+            String rates = "";
+            if (it.durMs > 0) {
+                rates = String.format(Locale.US, " [source %d kbps, asked %d kbps, got %d kbps]",
+                        it.srcBps / 1000, it.tgtBps / 1000, big * 8000L / it.durMs / 1000);
+            }
+            it.status = "Skipped - result " + human(big) + " is not smaller than the original" + rates;
             refresh(it);
             index++;
             startNext();
@@ -588,6 +623,14 @@ public class MainActivity extends AppCompatActivity {
     private static int toInt(String s) {
         try {
             return s == null ? 0 : Integer.parseInt(s.trim());
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private static long toLong(String s) {
+        try {
+            return s == null ? 0 : Long.parseLong(s.trim());
         } catch (Exception e) {
             return 0;
         }
