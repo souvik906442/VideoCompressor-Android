@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.UriPermission;
 import android.database.Cursor;
+import android.media.MediaCodecInfo;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.Bundle;
@@ -406,12 +407,18 @@ public class MainActivity extends AppCompatActivity {
             double base = br > 0 ? br : 2_500_000.0;
             double scale = dispH > 0 ? Math.pow((double) outH / dispH, 2) : 1.0;
             double bps = base * qFactor * scale * (h265 ? 0.7 : 1.0);
-            int bitrate = (int) Math.max(250_000, Math.min(bps, 50_000_000));
+            if (br > 0) bps = Math.min(bps, br);          // never ask for more than the source had
+            int bitrate = (int) Math.max(200_000, Math.min(bps, 50_000_000));
 
             tb.setVideoMimeType(h265 ? MimeTypes.VIDEO_H265 : MimeTypes.VIDEO_H264);
             tb.setEncoderFactory(new DefaultEncoderFactory.Builder(this)
                     .setRequestedVideoEncoderSettings(
-                            new VideoEncoderSettings.Builder().setBitrate(bitrate).build())
+                            new VideoEncoderSettings.Builder()
+                                    .setBitrate(bitrate)
+                                    // CBR makes the phone's encoder really stick to the target size
+                                    .setBitrateMode(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+                                    .setiFrameIntervalSeconds(4f)
+                                    .build())
                     .build());
         }
         transformer = tb.build();
@@ -419,11 +426,21 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void jobDone(final Item it) {
+        final File src = tmpOut;
+        final boolean audio = audioMode;
+        // compress gave a bigger file than the original -> don't keep it
+        if (!audio && startMs == 0 && endMs == 0 && it.size > 0 && src.length() >= it.size) {
+            long big = src.length();
+            src.delete();
+            it.status = "Skipped - result " + human(big) + " is not smaller than the original";
+            refresh(it);
+            index++;
+            startNext();
+            return;
+        }
         saving = true;
         it.status = "Saving…";
         refresh(it);
-        final File src = tmpOut;
-        final boolean audio = audioMode;
         io.execute(() -> {
             long outSize = -1;
             String err = null;
