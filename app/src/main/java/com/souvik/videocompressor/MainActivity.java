@@ -3,12 +3,15 @@ package com.souvik.videocompressor;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.UriPermission;
 import android.database.Cursor;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.view.View;
@@ -82,7 +85,9 @@ public class MainActivity extends AppCompatActivity {
     private CheckBox cbMute;
     private EditText etStart, etEnd;
     private ProgressBar progress;
-    private TextView tvStatus;
+    private TextView tvStatus, tvOut;
+    private SharedPreferences prefs;
+    private volatile Uri outTree;   // user-chosen save folder (null = Movies/VideoCompressor)
 
     // run state
     private Transformer transformer;
@@ -102,6 +107,20 @@ public class MainActivity extends AppCompatActivity {
                 if (uris != null && !uris.isEmpty()) addUris(uris);
             });
 
+    private final ActivityResultLauncher<Uri> folderPicker = registerForActivityResult(
+            new ActivityResultContracts.OpenDocumentTree(),
+            uri -> {
+                if (uri == null) return;
+                try {
+                    getContentResolver().takePersistableUriPermission(uri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                } catch (Exception ignored) {
+                }
+                outTree = uri;
+                prefs.edit().putString("out_tree", uri.toString()).apply();
+                updateOutLabel();
+            });
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -118,6 +137,22 @@ public class MainActivity extends AppCompatActivity {
         etEnd = findViewById(R.id.etEnd);
         progress = findViewById(R.id.progress);
         tvStatus = findViewById(R.id.tvStatus);
+        tvOut = findViewById(R.id.tvOut);
+        prefs = getSharedPreferences("vc", MODE_PRIVATE);
+        String saved = prefs.getString("out_tree", null);
+        if (saved != null) {
+            Uri u = Uri.parse(saved);
+            for (UriPermission up : getContentResolver().getPersistedUriPermissions()) {
+                if (up.getUri().equals(u) && up.isWritePermission()) outTree = u;
+            }
+        }
+        updateOutLabel();
+        ((Button) findViewById(R.id.btnBrowse)).setOnClickListener(v -> folderPicker.launch(null));
+        ((Button) findViewById(R.id.btnDefaultOut)).setOnClickListener(v -> {
+            outTree = null;
+            prefs.edit().remove("out_tree").apply();
+            updateOutLabel();
+        });
 
         spQuality = setupSpinner(R.id.spQuality, new String[]{"High", "Medium", "Low"}, 1);
         spCodec = setupSpinner(R.id.spCodec, new String[]{"H.264 (most compatible)", "H.265 (smaller)"}, 0);
@@ -165,6 +200,22 @@ public class MainActivity extends AppCompatActivity {
         s.setAdapter(a);
         s.setSelection(selected);
         return s;
+    }
+
+    private void updateOutLabel() {
+        Uri t = outTree;
+        if (t == null) {
+            tvOut.setText("Save to: Movies/VideoCompressor (default)");
+            return;
+        }
+        String name = "chosen folder";
+        try (Cursor c = getContentResolver().query(
+                DocumentsContract.buildDocumentUriUsingTree(t, DocumentsContract.getTreeDocumentId(t)),
+                new String[]{DocumentsContract.Document.COLUMN_DISPLAY_NAME}, null, null, null)) {
+            if (c != null && c.moveToFirst() && c.getString(0) != null) name = c.getString(0);
+        } catch (Exception ignored) {
+        }
+        tvOut.setText("Save to: " + name);
     }
 
     private void updateModeUi() {
@@ -427,7 +478,9 @@ public class MainActivity extends AppCompatActivity {
         } else {
             progress.setProgress(1000);
             tvStatus.setText("Finished: " + okCount + " of " + items.size() + " done  -  total time " + total
-                    + "\nSaved in " + (audioMode ? "Music" : "Movies") + "/VideoCompressor");
+                    + "\n" + (outTree == null
+                    ? "Saved in " + (audioMode ? "Music" : "Movies") + "/VideoCompressor"
+                    : "Saved in your chosen folder"));
         }
     }
 
@@ -461,6 +514,25 @@ public class MainActivity extends AppCompatActivity {
         String outName = audio ? base + ".m4a" : base + "_compressed.mp4";
 
         ContentResolver cr = getContentResolver();
+        Uri tree = outTree;
+        if (tree != null) {
+            Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+            Uri d = DocumentsContract.createDocument(cr, parent, audio ? "audio/mp4" : "video/mp4", outName);
+            if (d == null) throw new Exception("cannot create file in chosen folder");
+            try (InputStream in = new FileInputStream(src); OutputStream out = cr.openOutputStream(d)) {
+                if (out == null) throw new Exception("cannot open output");
+                byte[] b = new byte[256 * 1024];
+                int k;
+                while ((k = in.read(b)) > 0) out.write(b, 0, k);
+            } catch (Exception e) {
+                try {
+                    DocumentsContract.deleteDocument(cr, d);
+                } catch (Exception ignored) {
+                }
+                throw e;
+            }
+            return src.length();
+        }
         ContentValues cv = new ContentValues();
         cv.put(MediaStore.MediaColumns.DISPLAY_NAME, outName);
         cv.put(MediaStore.MediaColumns.MIME_TYPE, audio ? "audio/mp4" : "video/mp4");
