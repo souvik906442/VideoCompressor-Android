@@ -10,8 +10,9 @@ android {
         applicationId 'com.souvik.videocompressor'
         minSdk 29
         targetSdk 34
-        versionCode 1
-        versionName '1.0'
+        versionCode 2
+        versionName '2.0'
+        ndk { abiFilters 'arm64-v8a' }   // the ffmpeg library is published for 64-bit phones only
     }
     buildTypes {
         release { minifyEnabled false }
@@ -25,7 +26,6 @@ android {
 
 dependencies {
     implementation 'androidx.appcompat:appcompat:1.6.1'
-    implementation 'androidx.media3:media3-common:1.5.1'
-    implementation 'androidx.media3:media3-effect:1.5.1'
-    implementation 'androidx.media3:media3-transformer:1.5.1'
+    // ffmpeg with x264/x265 (GPL build) - same engine the original Video Compressor app uses
+    implementation 'dev.ffmpegkit-maintained:ffmpeg-kit-min-gpl:8.1.7'
 }

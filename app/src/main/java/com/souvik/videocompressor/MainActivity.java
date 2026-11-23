@@ -6,7 +6,6 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.UriPermission;
 import android.database.Cursor;
-import android.media.MediaCodecInfo;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.Bundle;
@@ -31,23 +30,11 @@ import android.widget.Toast;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.media3.common.Effect;
-import androidx.media3.common.MediaItem;
-import androidx.media3.common.MimeTypes;
-import androidx.media3.common.audio.AudioProcessor;
-import androidx.media3.common.audio.SonicAudioProcessor;
-import androidx.media3.effect.Presentation;
-import androidx.media3.effect.ScaleAndRotateTransformation;
-import androidx.media3.transformer.AudioEncoderSettings;
-import androidx.media3.transformer.Composition;
-import androidx.media3.transformer.DefaultEncoderFactory;
-import androidx.media3.transformer.EditedMediaItem;
-import androidx.media3.transformer.Effects;
-import androidx.media3.transformer.ExportException;
-import androidx.media3.transformer.ExportResult;
-import androidx.media3.transformer.ProgressHolder;
-import androidx.media3.transformer.Transformer;
-import androidx.media3.transformer.VideoEncoderSettings;
+
+import com.arthenica.ffmpegkit.FFmpegKit;
+import com.arthenica.ffmpegkit.FFmpegKitConfig;
+import com.arthenica.ffmpegkit.FFmpegSession;
+import com.arthenica.ffmpegkit.ReturnCode;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -94,7 +81,8 @@ public class MainActivity extends AppCompatActivity {
     private volatile Uri outTree;   // user-chosen save folder (null = Movies/VideoCompressor)
 
     // run state
-    private Transformer transformer;
+    private FFmpegSession session;
+    private volatile float jobProgress;   // 0..1 of the current file
     private boolean running, cancelled, saving;
     private int index, okCount;
     private long t0, tJob;
@@ -102,7 +90,7 @@ public class MainActivity extends AppCompatActivity {
     // options captured at Start
     private boolean audioMode, mute, h265;
     private int resH, rotDeg;
-    private double qFactor;
+    private int crf;        // x264 quality: lower = better picture, bigger file
     private int audioBps;
     private long startMs, endMs;
 
@@ -290,11 +278,11 @@ public class MainActivity extends AppCompatActivity {
         mute = cbMute.isChecked();
         h265 = spCodec.getSelectedItemPosition() == 1;
         int q = spQuality.getSelectedItemPosition();
-        qFactor = q == 0 ? 0.6 : (q == 1 ? 0.4 : 0.25);        // share of the source VIDEO bitrate
-        audioBps = q == 0 ? 96_000 : (q == 1 ? 64_000 : 48_000);
+        crf = q == 0 ? 24 : (q == 1 ? 28 : 31);                  // constant-quality encoding (like the original app)
+        audioBps = q == 0 ? 128_000 : (q == 1 ? 96_000 : 64_000);
         int[] heights = {0, 1080, 720, 480, 360};
         resH = heights[spRes.getSelectedItemPosition()];
-        int[] rots = {0, 270, 180, 90};   // Media3 rotates counter-clockwise
+        int[] rots = {0, 90, 180, 270};   // degrees clockwise
         rotDeg = rots[spRot.getSelectedItemPosition()];
 
         for (Item it : items) {
@@ -323,7 +311,7 @@ public class MainActivity extends AppCompatActivity {
         tvStatus.setText("Cancelling…");
         if (!saving) {
             try {
-                if (transformer != null) transformer.cancel();
+                if (session != null) FFmpegKit.cancel(session.getSessionId());
             } catch (Exception ignored) {
             }
             if (index < items.size()) {
@@ -352,19 +340,12 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void buildAndStart(final Item it) {
-        // --- read source info (for a sensible target bitrate)
-        int w = 0, h = 0, rot = 0;
-        long br = 0, durMs = 0;
-        int fps = 0;
+        // --- duration of the source (for progress + a size cap)
+        long durMs = 0;
         MediaMetadataRetriever r = new MediaMetadataRetriever();
         try {
             r.setDataSource(this, it.uri);
-            w = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH));
-            h = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT));
-            rot = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION));
-            br = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE));
             durMs = toLong(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION));
-            fps = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE));
         } catch (Exception ignored) {
         } finally {
             try {
@@ -372,96 +353,114 @@ public class MainActivity extends AppCompatActivity {
             } catch (Exception ignored) {
             }
         }
-        int dispH = (rot == 90 || rot == 270) ? w : h;     // height as seen by the viewer
-        if (rotDeg == 90 || rotDeg == 270) dispH = (rot == 90 || rot == 270) ? h : w;
-        int dispW = (rot == 90 || rot == 270) ? h : w;     // width as seen by the viewer
-        if (rotDeg == 90 || rotDeg == 270) dispW = (rot == 90 || rot == 270) ? w : h;
+        long effMs = durMs;
+        if (startMs > 0 && effMs > 0) effMs = Math.max(effMs - startMs, 0);
+        if (endMs > 0) effMs = effMs > 0 ? Math.min(effMs, endMs - startMs) : endMs - startMs;
+        final long progressMs = effMs;
+        it.durMs = durMs;
+        it.srcBps = (durMs > 0 && it.size > 0) ? it.size * 8000L / durMs : 0;
 
-        MediaItem.Builder mib = new MediaItem.Builder().setUri(it.uri);
-        if (startMs > 0 || endMs > 0) {
-            MediaItem.ClippingConfiguration.Builder cc = new MediaItem.ClippingConfiguration.Builder();
-            if (startMs > 0) cc.setStartPositionMs(startMs);
-            if (endMs > 0) cc.setEndPositionMs(endMs);
-            mib.setClippingConfiguration(cc.build());
+        String inArg = FFmpegKitConfig.getSafParameterForRead(this, it.uri);
+        if (inArg == null) {
+            jobFailed(it, "Cannot open this video");
+            return;
         }
 
-        EditedMediaItem.Builder emb = new EditedMediaItem.Builder(mib.build());
-        Transformer.Builder tb = new Transformer.Builder(this).addListener(new Transformer.Listener() {
-            @Override
-            public void onCompleted(Composition composition, ExportResult exportResult) {
-                if (!cancelled) jobDone(it);
-            }
-
-            @Override
-            public void onError(Composition composition, ExportResult exportResult, ExportException e) {
-                if (!cancelled) jobFailed(it, "Failed: " + e.getErrorCodeName());
-            }
-        });
+        List<String> a = new ArrayList<>();
+        a.add("-y");
+        a.add("-hide_banner");
+        if (startMs > 0) {
+            a.add("-ss");
+            a.add(secs(startMs));
+        }
+        a.add("-i");
+        a.add(inArg);
+        if (endMs > 0) {
+            a.add("-t");
+            a.add(secs(endMs - startMs));
+        }
 
         if (audioMode) {
-            emb.setRemoveVideo(true);
-            tb.setAudioMimeType(MimeTypes.AUDIO_AAC);
+            a.add("-vn");
+            a.add("-c:a");
+            a.add("aac");
+            a.add("-b:a");
+            a.add("128k");
         } else {
-            List<Effect> fx = new ArrayList<>();
-            if (rotDeg != 0) {
-                fx.add(new ScaleAndRotateTransformation.Builder().setRotationDegrees(rotDeg).build());
+            a.add("-map");
+            a.add("0:v:0");
+            if (!mute) {
+                a.add("-map");
+                a.add("0:a?");
             }
-            int outH = dispH;
-            if (resH > 0 && dispH > resH) {
-                fx.add(Presentation.createForHeight(resH));
-                outH = resH;
+            // picture filters (ffmpeg already turns the picture upright before them)
+            List<String> vf = new ArrayList<>();
+            if (rotDeg == 90) vf.add("transpose=1");
+            else if (rotDeg == 270) vf.add("transpose=2");
+            else if (rotDeg == 180) vf.add("hflip,vflip");
+            if (resH > 0) vf.add("scale=-2:'min(ih," + resH + ")'");
+            if (!vf.isEmpty()) {
+                a.add("-vf");
+                a.add(android.text.TextUtils.join(",", vf));
             }
-            // Resampling to 32 kHz forces the audio to be re-encoded (at a low bitrate) instead of copied
-            SonicAudioProcessor sonic = new SonicAudioProcessor();
-            sonic.setOutputSampleRateHz(32000);
-            emb.setEffects(new Effects(Collections.<AudioProcessor>singletonList(sonic), fx));
-            if (mute) emb.setRemoveAudio(true);
-
-            // Real average bitrate of the file (size / duration). The "bitrate" tag in the metadata is
-            // often missing or wrong, which made the old guess (2 Mbps) far too high for small files.
-            long srcBps = (durMs > 0 && it.size > 0) ? it.size * 8000L / durMs : br;
-            if (srcBps <= 0) srcBps = 2_000_000L;
-            double audioEst = Math.min(128_000, srcBps * 0.25);       // audio part of the source bitrate
-            double base = Math.max(srcBps - audioEst, 100_000);         // video part
-            double scale = dispH > 0 ? Math.pow((double) outH / dispH, 2) : 1.0;
-            double bps = base * qFactor * scale * (h265 ? 0.7 : 1.0);
-            int bitrate = (int) Math.max(120_000, Math.min(bps, 50_000_000));
-            it.durMs = durMs;
-            it.srcBps = srcBps;
-            it.tgtBps = bitrate;
-
-            // A phone's hardware encoder cannot hold a very low bitrate for a big picture: it quietly
-            // produces MORE than asked. Estimate that, and don't waste minutes when the file is already
-            // as small as this picture size allows.
-            double fpsUse = fps > 0 ? Math.min(fps, 30) : 30;
-            double outW = dispH > 0 ? (double) dispW * outH / dispH : 0;
-            double floorBps = outW * outH * fpsUse * (h265 ? 0.03 : 0.045);
-            long estTotal = (long) ((Math.max(bitrate, floorBps) + (mute ? 0 : audioBps)) * durMs / 8000.0);
-            boolean plainCompress = rotDeg == 0 && !mute && startMs == 0 && endMs == 0;
-            if (durMs > 0 && it.size > 0 && plainCompress && estTotal >= it.size * 0.9) {
-                it.status = "Skipped - already very small (about " + (srcBps / 1000) + " kbps). "
-                        + "Compressing again would not make it smaller. Try a lower resolution (e.g. 480p).";
-                refresh(it);
-                index++;
-                startNext();
-                return;
+            // the same recipe as the original app: x264, constant quality (CRF), preset fast
+            if (h265) {
+                a.add("-c:v");
+                a.add("libx265");
+                a.add("-crf");
+                a.add(String.valueOf(crf + 2));
+                a.add("-preset");
+                a.add("fast");
+                a.add("-tag:v");
+                a.add("hvc1");
+            } else {
+                a.add("-c:v");
+                a.add("libx264");
+                a.add("-crf");
+                a.add(String.valueOf(crf));
+                a.add("-preset");
+                a.add("fast");
+                a.add("-profile:v");
+                a.add("high");
             }
-
-            tb.setVideoMimeType(h265 ? MimeTypes.VIDEO_H265 : MimeTypes.VIDEO_H264);
-            tb.setEncoderFactory(new DefaultEncoderFactory.Builder(this)
-                    .setRequestedAudioEncoderSettings(
-                            new AudioEncoderSettings.Builder().setBitrate(audioBps).build())
-                    .setRequestedVideoEncoderSettings(
-                            new VideoEncoderSettings.Builder()
-                                    .setBitrate(bitrate)
-                                    // CBR makes the phone's encoder really stick to the target size
-                                    .setBitrateMode(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-                                    .setiFrameIntervalSeconds(4f)
-                                    .build())
-                    .build());
+            a.add("-pix_fmt");
+            a.add("yuv420p");
+            // safety net: never let the picture use more bits than the original did
+            if (it.srcBps > 0) {
+                long cap = Math.max(100_000L, (long) (it.srcBps * 0.85) - (mute ? 0 : audioBps));
+                a.add("-maxrate");
+                a.add(String.valueOf(cap));
+                a.add("-bufsize");
+                a.add(String.valueOf(cap * 2));
+            }
+            if (mute) {
+                a.add("-an");
+            } else {
+                a.add("-c:a");
+                a.add("aac");
+                a.add("-b:a");
+                a.add(String.valueOf(audioBps));
+            }
+            a.add("-movflags");
+            a.add("+faststart");
         }
-        transformer = tb.build();
-        transformer.start(emb.build(), tmpOut.getAbsolutePath());
+        a.add(tmpOut.getAbsolutePath());
+
+        jobProgress = 0f;
+        session = FFmpegKit.executeWithArgumentsAsync(a.toArray(new String[0]),
+                done -> handler.post(() -> {
+                    if (cancelled) return;
+                    if (ReturnCode.isSuccess(done.getReturnCode())) {
+                        jobDone(it);
+                    } else {
+                        jobFailed(it, "Failed: " + lastLine(done.getOutput()));
+                    }
+                }),
+                null,
+                st -> {
+                    double t = st.getTime();      // position written so far, in ms
+                    if (progressMs > 0 && t > 0) jobProgress = (float) Math.min(t / progressMs, 1.0);
+                });
     }
 
     private void jobDone(final Item it) {
@@ -473,8 +472,8 @@ public class MainActivity extends AppCompatActivity {
             src.delete();
             String rates = "";
             if (it.durMs > 0) {
-                rates = String.format(Locale.US, " [source %d kbps, asked %d kbps, got %d kbps]",
-                        it.srcBps / 1000, it.tgtBps / 1000, big * 8000L / it.durMs / 1000);
+                rates = String.format(Locale.US, " [source %d kbps, result %d kbps] - try Low quality or a smaller resolution",
+                        it.srcBps / 1000, big * 8000L / it.durMs / 1000);
             }
             it.status = "Skipped - result " + human(big) + " is not smaller than the original" + rates;
             refresh(it);
@@ -553,9 +552,8 @@ public class MainActivity extends AppCompatActivity {
             if (index < items.size()) {
                 Item it = items.get(index);
                 int pct = 0;
-                if (!saving && transformer != null) {
-                    ProgressHolder ph = new ProgressHolder();
-                    if (transformer.getProgress(ph) == Transformer.PROGRESS_STATE_AVAILABLE) pct = ph.progress;
+                if (!saving && session != null) {
+                    pct = Math.max(0, Math.min(99, (int) (jobProgress * 100)));
                     it.status = pct + "%";
                     refresh(it);
                 }
@@ -628,6 +626,22 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /** milliseconds -> "12.345" seconds for ffmpeg */
+    private static String secs(long ms) {
+        return String.format(Locale.US, "%.3f", ms / 1000.0);
+    }
+
+    /** last non-empty line of the ffmpeg log, shortened */
+    private static String lastLine(String log) {
+        if (log == null) return "unknown error";
+        String[] lines = log.trim().split("\\r?\\n");
+        for (int i = lines.length - 1; i >= 0; i--) {
+            String l = lines[i].trim();
+            if (!l.isEmpty()) return l.length() > 160 ? l.substring(l.length() - 160) : l;
+        }
+        return "unknown error";
+    }
+
     private static long toLong(String s) {
         try {
             return s == null ? 0 : Long.parseLong(s.trim());
@@ -662,7 +676,7 @@ public class MainActivity extends AppCompatActivity {
         super.onDestroy();
         handler.removeCallbacks(tick);
         try {
-            if (transformer != null && running) transformer.cancel();
+            if (session != null && running) FFmpegKit.cancel(session.getSessionId());
         } catch (Exception ignored) {
         }
         io.shutdown();
