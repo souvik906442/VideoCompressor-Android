@@ -64,6 +64,9 @@ public class MainActivity extends AppCompatActivity {
         String status = "Queued";
         TextView tv;
         long durMs, srcBps, tgtBps;   // for the "source / target / result" bitrate report
+        int hwStage;                   // 0 = hardware (constant rate), 1 = hardware (plain), 2 = software
+        int attempt;                   // size-fitting retries done
+        double abrScale = 1.0;         // lowers the bitrate after a file came out over the wanted size
     }
 
     private final List<Item> items = new ArrayList<>();
@@ -76,7 +79,9 @@ public class MainActivity extends AppCompatActivity {
     private Spinner spQuality, spCodec, spRes, spRot, spSpeed;
     private EditText etTarget;
     private double targetMB;
-    private String preset = "fast";
+    private String preset = "veryfast";
+    private boolean hardware;
+    private android.os.PowerManager.WakeLock wakeLock;
     private CheckBox cbMute;
     private EditText etStart, etEnd;
     private ProgressBar progress;
@@ -154,7 +159,7 @@ public class MainActivity extends AppCompatActivity {
 
         spQuality = setupSpinner(R.id.spQuality, new String[]{"High", "Medium", "Low"}, 1);
         spCodec = setupSpinner(R.id.spCodec, new String[]{"H.264 (most compatible)", "H.265 (smaller)"}, 0);
-        spSpeed = setupSpinner(R.id.spSpeed, new String[]{"Fastest (bigger file)", "Fast", "Balanced", "Smallest file (slow)"}, 2);
+        spSpeed = setupSpinner(R.id.spSpeed, new String[]{"Hardware (fastest)", "Fast software", "Balanced", "Better (slow)", "Smallest file (slowest)"}, 0);
         etTarget = findViewById(R.id.etTarget);
         spRes = setupSpinner(R.id.spRes, new String[]{"Original", "1080p", "720p", "480p", "360p"}, 0);
         spRot = setupSpinner(R.id.spRot, new String[]{"None", "90° right", "180°", "90° left"}, 0);
@@ -364,7 +369,9 @@ public class MainActivity extends AppCompatActivity {
         int q = spQuality.getSelectedItemPosition();
         crf = q == 0 ? 24 : (q == 1 ? 28 : 31);                  // constant-quality encoding (like the original app)
         audioBps = q == 0 ? 128_000 : (q == 1 ? 96_000 : 64_000);
-        preset = new String[]{"ultrafast", "veryfast", "fast", "medium"}[spSpeed.getSelectedItemPosition()];
+        int sp = spSpeed.getSelectedItemPosition();
+        hardware = sp == 0;                       // phone's video chip; falls back to software if it fails
+        preset = new String[]{"veryfast", "veryfast", "fast", "medium", "slow"}[sp];
         targetMB = 0;
         String tt = etTarget.getText().toString().trim().replace(',', '.');
         if (!tt.isEmpty() && !audioMode) {
@@ -385,6 +392,9 @@ public class MainActivity extends AppCompatActivity {
 
         for (Item it : items) {
             it.status = "Queued";
+            it.hwStage = 0;
+            it.attempt = 0;
+            it.abrScale = 1.0;
             refresh(it);
         }
         cancelled = false;
@@ -399,6 +409,12 @@ public class MainActivity extends AppCompatActivity {
         btnAdd.setEnabled(false);
         btnClear.setEnabled(false);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        try {
+            android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+            wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "videocompressor:work");
+            wakeLock.acquire(6 * 60 * 60 * 1000L);   // keeps the CPU awake if the screen turns off
+        } catch (Exception ignored) {
+        }
         handler.post(tick);
         startNext();
     }
@@ -478,6 +494,8 @@ public class MainActivity extends AppCompatActivity {
             a.add(secs(endMs - startMs));
         }
 
+        final boolean useHw = !audioMode && hardware && it.hwStage < 2;   // try the phone's video chip first
+
         if (audioMode) {
             a.add("-vn");
             a.add("-c:a");
@@ -517,39 +535,61 @@ public class MainActivity extends AppCompatActivity {
                     startNext();
                     return;
                 }
-                abrBps = (long) (targetBytes * 8 / effSec * 0.96) - (mute ? 0 : audioBps);   // ~4% container overhead
+                abrBps = (long) ((targetBytes * 8 / effSec * 0.96 - (mute ? 0 : audioBps)) * it.abrScale);   // ~4% container overhead
                 if (abrBps < 60_000) {
                     jobFailed(it, "Target size is too small for this video length");
                     return;
                 }
             }
-            // x264 / x265 with constant quality (CRF) - or a bitrate when a target size is set
-            a.add("-c:v");
-            a.add(h265 ? "libx265" : "libx264");
-            if (abrBps > 0) {
+            if (useHw) {
+                // the phone's video chip: much faster, picture quality is a little lower per MB
+                long hwBps = abrBps;
+                if (hwBps <= 0) {
+                    long srcVideo = it.srcBps > 0 ? it.srcBps - (mute ? 0 : audioBps) : 2_000_000L;
+                    double f = crf <= 24 ? 0.7 : (crf <= 28 ? 0.5 : 0.35);      // High / Medium / Low
+                    hwBps = Math.max(300_000L, (long) (srcVideo * f));
+                }
+                a.add("-c:v");
+                a.add(h265 ? "hevc_mediacodec" : "h264_mediacodec");
                 a.add("-b:v");
-                a.add(String.valueOf(abrBps));
-                a.add("-maxrate");
-                a.add(String.valueOf(abrBps * 13 / 10));
-                a.add("-bufsize");
-                a.add(String.valueOf(abrBps * 2));
+                a.add(String.valueOf(hwBps));
+                if (it.hwStage == 0) {          // constant bitrate = the file size comes out predictable
+                    a.add("-bitrate_mode");
+                    a.add("cbr");
+                }
+                if (h265) {
+                    a.add("-tag:v");
+                    a.add("hvc1");
+                }
             } else {
-                a.add("-crf");
-                a.add(String.valueOf(h265 ? crf + 2 : crf));
+                // x264 / x265 with constant quality (CRF) - or a bitrate when a target size is set
+                a.add("-c:v");
+                a.add(h265 ? "libx265" : "libx264");
+                if (abrBps > 0) {
+                    a.add("-b:v");
+                    a.add(String.valueOf(abrBps));
+                    a.add("-maxrate");
+                    a.add(String.valueOf(abrBps));          // strict: never above the wanted rate
+                    a.add("-bufsize");
+                    a.add(String.valueOf(abrBps));
+                } else {
+                    a.add("-crf");
+                    a.add(String.valueOf(h265 ? crf + 2 : crf));
+                }
+                a.add("-preset");
+                a.add(preset);
+                if (h265) {
+                    a.add("-tag:v");
+                    a.add("hvc1");
+                } else {
+                    a.add("-profile:v");
+                    a.add("high");
+                }
+                a.add("-pix_fmt");
+                a.add("yuv420p");
             }
-            a.add("-preset");
-            a.add(preset);
-            if (h265) {
-                a.add("-tag:v");
-                a.add("hvc1");
-            } else {
-                a.add("-profile:v");
-                a.add("high");
-            }
-            a.add("-pix_fmt");
-            a.add("yuv420p");
             // safety net: never let the picture use more bits than the original did
-            if (abrBps == 0 && it.srcBps > 0) {
+            if (!useHw && abrBps == 0 && it.srcBps > 0) {
                 long cap = Math.max(100_000L, (long) (it.srcBps * 0.85) - (mute ? 0 : audioBps));
                 a.add("-maxrate");
                 a.add(String.valueOf(cap));
@@ -575,6 +615,16 @@ public class MainActivity extends AppCompatActivity {
                     if (cancelled) return;
                     if (ReturnCode.isSuccess(done.getReturnCode())) {
                         jobDone(it);
+                    } else if (useHw) {
+                        it.hwStage++;                             // hardware refused: plain hardware, then software
+                        tmpOut.delete();
+                        it.status = it.hwStage == 1 ? "Retrying hardware encoder…" : "Hardware encoder failed - using software instead";
+                        refresh(it);
+                        try {
+                            buildAndStart(it);
+                        } catch (Throwable e) {
+                            jobFailed(it, "Engine error: " + e);
+                        }
                     } else {
                         jobFailed(it, "Failed: " + lastLine(done.getOutput()));
                     }
@@ -589,6 +639,23 @@ public class MainActivity extends AppCompatActivity {
     private void jobDone(final Item it) {
         final File src = tmpOut;
         final boolean audio = audioMode;
+        // wanted size set, but the file came out bigger: lower the bitrate and encode again (up to 3 times)
+        if (!audio && targetMB > 0 && it.attempt < 3) {
+            long limit = (long) (targetMB * 1024 * 1024);
+            if (src.length() > limit) {
+                it.attempt++;
+                it.abrScale *= 0.97 * limit / (double) src.length();
+                src.delete();
+                it.status = "Over " + human(limit) + " - adjusting (try " + (it.attempt + 1) + ")…";
+                refresh(it);
+                try {
+                    buildAndStart(it);
+                } catch (Throwable e) {
+                    jobFailed(it, "Engine error: " + e);
+                }
+                return;
+            }
+        }
         // compress gave a bigger file than the original -> don't keep it
         if (!audio && startMs == 0 && endMs == 0 && it.size > 0 && src.length() >= it.size) {
             long big = src.length();
@@ -627,6 +694,9 @@ public class MainActivity extends AppCompatActivity {
                         long pct = (fOut - it.size) * 100 / it.size;
                         text += String.format(Locale.US, " (%+d%%)", pct);
                     }
+                    if (!audio && targetMB > 0 && fOut > (long) (targetMB * 1024 * 1024)) {
+                        text += " (a little over the target)";
+                    }
                     text += " in " + hms((System.currentTimeMillis() - tJob) / 1000);
                     it.status = text;
                 } else {
@@ -650,6 +720,7 @@ public class MainActivity extends AppCompatActivity {
     private void finishAll() {
         running = false;
         handler.removeCallbacks(tick);
+        releaseWakeLock();
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         btnStart.setEnabled(true);
         btnCancel.setEnabled(false);
@@ -681,8 +752,13 @@ public class MainActivity extends AppCompatActivity {
                     refresh(it);
                 }
                 progress.setProgress((int) ((index + pct / 100f) / items.size() * 1000));
-                tvStatus.setText(String.format(Locale.US, "[%d/%d] %s    Elapsed %s",
-                        index + 1, items.size(), it.name, hms((System.currentTimeMillis() - t0) / 1000)));
+                String left = "";
+                if (!saving && pct >= 2) {
+                    long el = (System.currentTimeMillis() - tJob) / 1000;
+                    left = "    ~" + hms(el * (100 - pct) / pct) + " left";
+                }
+                tvStatus.setText(String.format(Locale.US, "[%d/%d] %s    Elapsed %s%s",
+                        index + 1, items.size(), it.name, hms((System.currentTimeMillis() - t0) / 1000), left));
             }
             handler.postDelayed(this, 500);
         }
@@ -794,9 +870,17 @@ public class MainActivity extends AppCompatActivity {
         return String.format(Locale.US, "%.2f GB", m / 1024);
     }
 
+    private void releaseWakeLock() {
+        try {
+            if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        } catch (Exception ignored) {
+        }
+    }
+
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        releaseWakeLock();
         handler.removeCallbacks(tick);
         try {
             if (session != null && running) FFmpegKit.cancel(session.getSessionId());
