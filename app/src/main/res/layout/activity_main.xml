@@ -62,17 +62,29 @@
         <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Codec" />
         <Spinner android:id="@+id/spCodec" android:layout_width="match_parent" android:layout_height="wrap_content" />
 
-        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Speed" />
-        <Spinner android:id="@+id/spSpeed" android:layout_width="match_parent" android:layout_height="wrap_content" />
-
         <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Resolution" />
         <Spinner android:id="@+id/spRes" android:layout_width="match_parent" android:layout_height="wrap_content" />
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Speed" />
+        <Spinner android:id="@+id/spSpeed" android:layout_width="match_parent" android:layout_height="wrap_content" />
 
         <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Rotate" />
         <Spinner android:id="@+id/spRot" android:layout_width="match_parent" android:layout_height="wrap_content" />
 
         <CheckBox android:id="@+id/cbMute" android:layout_width="wrap_content"
             android:layout_height="wrap_content" android:text="Remove audio" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Target size (MB)" />
+            <EditText android:id="@+id/etTarget" android:layout_width="0dp" android:layout_height="wrap_content"
+                android:layout_weight="1" android:hint="auto" android:inputType="numberDecimal" />
+        </LinearLayout>
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="(optional: shrink each video to about this size)" android:textSize="12sp" />
 
         <LinearLayout
             android:layout_width="match_parent"

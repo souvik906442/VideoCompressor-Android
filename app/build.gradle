@@ -28,10 +28,4 @@ dependencies {
     implementation 'androidx.appcompat:appcompat:1.6.1'
     // ffmpeg with x264/x265 (GPL build) - same engine the original Video Compressor app uses
     implementation 'dev.ffmpegkit-maintained:ffmpeg-kit-min-gpl:8.1.7'
-    // ffmpeg-kit needs this at runtime but the fork's POM does not pull it in (caused NoClassDefFoundError)
-    implementation 'com.arthenica:smart-exception-java:0.2.1'
-    // Android's own hardware transcoder (fast, honours the target bitrate)
-    implementation 'androidx.media3:media3-transformer:1.5.1'
-    implementation 'androidx.media3:media3-effect:1.5.1'
-    implementation 'androidx.media3:media3-common:1.5.1'
 }

@@ -1,10 +1,6 @@
 package com.souvik.videocompressor;
 
-import android.app.ApplicationExitInfo;
-import android.content.ClipData;
-import android.content.ClipboardManager;
 import android.content.ContentResolver;
-import android.content.Context;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -12,11 +8,9 @@ import android.content.UriPermission;
 import android.database.Cursor;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.ParcelFileDescriptor;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
@@ -35,35 +29,17 @@ import android.widget.Toast;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
-import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.media3.common.Effect;
-import androidx.media3.common.MediaItem;
-import androidx.media3.common.MimeTypes;
-import androidx.media3.effect.Presentation;
-import androidx.media3.effect.ScaleAndRotateTransformation;
-import androidx.media3.transformer.Composition;
-import androidx.media3.transformer.DefaultEncoderFactory;
-import androidx.media3.transformer.EditedMediaItem;
-import androidx.media3.transformer.Effects;
-import androidx.media3.transformer.ExportException;
-import androidx.media3.transformer.ExportResult;
-import androidx.media3.transformer.ProgressHolder;
-import androidx.media3.transformer.Transformer;
-import androidx.media3.transformer.VideoEncoderSettings;
 
 import com.arthenica.ffmpegkit.FFmpegKit;
 import com.arthenica.ffmpegkit.FFmpegKitConfig;
 import com.arthenica.ffmpegkit.FFmpegSession;
 import com.arthenica.ffmpegkit.ReturnCode;
 
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.io.PrintWriter;
-import java.io.StringWriter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -97,6 +73,9 @@ public class MainActivity extends AppCompatActivity {
     private Button btnAdd, btnClear, btnStart, btnCancel;
     private RadioButton rbAudio;
     private Spinner spQuality, spCodec, spRes, spRot, spSpeed;
+    private EditText etTarget;
+    private double targetMB;
+    private String preset = "fast";
     private CheckBox cbMute;
     private EditText etStart, etEnd;
     private ProgressBar progress;
@@ -111,14 +90,9 @@ public class MainActivity extends AppCompatActivity {
     private int index, okCount;
     private long t0, tJob;
     private File tmpOut;
-    private ParcelFileDescriptor inPfd;   // input kept open while ffmpeg reads it
     // options captured at Start
     private boolean audioMode, mute, h265;
     private int resH, rotDeg;
-    private int speedMode;   // 0 = hardware encoder, 1 = x264 veryfast, 2 = x264 fast
-    private int qIdx;       // 0 high, 1 medium, 2 low
-    private boolean triedFallback;
-    private Transformer transformer;   // hardware path (null when ffmpeg is used)
     private int crf;        // x264 quality: lower = better picture, bigger file
     private int audioBps;
     private long startMs, endMs;
@@ -145,7 +119,6 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-        installCrashLogger();
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
@@ -179,7 +152,8 @@ public class MainActivity extends AppCompatActivity {
 
         spQuality = setupSpinner(R.id.spQuality, new String[]{"High", "Medium", "Low"}, 1);
         spCodec = setupSpinner(R.id.spCodec, new String[]{"H.264 (most compatible)", "H.265 (smaller)"}, 0);
-        spSpeed = setupSpinner(R.id.spSpeed, new String[]{"Hardware (fastest)", "Fast (software)", "Best compression (slow)"}, 0);
+        spSpeed = setupSpinner(R.id.spSpeed, new String[]{"Fastest (bigger file)", "Fast", "Balanced", "Smallest file (slow)"}, 2);
+        etTarget = findViewById(R.id.etTarget);
         spRes = setupSpinner(R.id.spRes, new String[]{"Original", "1080p", "720p", "480p", "360p"}, 0);
         spRot = setupSpinner(R.id.spRot, new String[]{"None", "90° right", "180°", "90° left"}, 0);
 
@@ -195,7 +169,6 @@ public class MainActivity extends AppCompatActivity {
                 (g, id) -> updateModeUi());
 
         handleIntent(getIntent());
-        showLastCrash();
     }
 
     @Override
@@ -247,8 +220,9 @@ public class MainActivity extends AppCompatActivity {
         boolean video = !rbAudio.isChecked();
         spQuality.setEnabled(video);
         spCodec.setEnabled(video);
-        spSpeed.setEnabled(video);
         spRes.setEnabled(video);
+        spSpeed.setEnabled(video);
+        etTarget.setEnabled(video);
         spRot.setEnabled(video);
         cbMute.setEnabled(video);
     }
@@ -311,10 +285,22 @@ public class MainActivity extends AppCompatActivity {
         mute = cbMute.isChecked();
         h265 = spCodec.getSelectedItemPosition() == 1;
         int q = spQuality.getSelectedItemPosition();
-        qIdx = q;
-        speedMode = spSpeed.getSelectedItemPosition();
         crf = q == 0 ? 24 : (q == 1 ? 28 : 31);                  // constant-quality encoding (like the original app)
         audioBps = q == 0 ? 128_000 : (q == 1 ? 96_000 : 64_000);
+        preset = new String[]{"ultrafast", "veryfast", "fast", "medium"}[spSpeed.getSelectedItemPosition()];
+        targetMB = 0;
+        String tt = etTarget.getText().toString().trim().replace(',', '.');
+        if (!tt.isEmpty() && !audioMode) {
+            try {
+                targetMB = Double.parseDouble(tt);
+            } catch (Exception e) {
+                targetMB = -1;
+            }
+            if (targetMB <= 0) {
+                Toast.makeText(this, "Target size must be a number like 25 (MB).", Toast.LENGTH_LONG).show();
+                return;
+            }
+        }
         int[] heights = {0, 1080, 720, 480, 360};
         resH = heights[spRes.getSelectedItemPosition()];
         int[] rots = {0, 90, 180, 270};   // degrees clockwise
@@ -347,7 +333,6 @@ public class MainActivity extends AppCompatActivity {
         if (!saving) {
             try {
                 if (session != null) FFmpegKit.cancel(session.getSessionId());
-                if (transformer != null) transformer.cancel();
             } catch (Exception ignored) {
             }
             if (index < items.size()) {
@@ -365,34 +350,23 @@ public class MainActivity extends AppCompatActivity {
         }
         final Item it = items.get(index);
         it.status = "Starting…";
-        triedFallback = false;
         refresh(it);
         tJob = System.currentTimeMillis();
         tmpOut = new File(getCacheDir(), "out_" + System.nanoTime() + (audioMode ? ".m4a" : ".mp4"));
         try {
             buildAndStart(it);
-        } catch (Throwable e) {   // includes UnsatisfiedLinkError etc. from the ffmpeg native library
-            jobFailed(it, "Error: " + e);
+        } catch (Exception e) {
+            jobFailed(it, String.valueOf(e.getMessage()));
         }
     }
 
     private void buildAndStart(final Item it) {
-        transformer = null;
         // --- duration of the source (for progress + a size cap)
         long durMs = 0;
-        int srcW = 0, srcH = 0;
         MediaMetadataRetriever r = new MediaMetadataRetriever();
         try {
             r.setDataSource(this, it.uri);
             durMs = toLong(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION));
-            srcW = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH));
-            srcH = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT));
-            int rot0 = toInt(r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION));
-            if (rot0 == 90 || rot0 == 270) {
-                int t = srcW;
-                srcW = srcH;
-                srcH = t;
-            }
         } catch (Exception ignored) {
         } finally {
             try {
@@ -407,11 +381,6 @@ public class MainActivity extends AppCompatActivity {
         it.durMs = durMs;
         it.srcBps = (durMs > 0 && it.size > 0) ? it.size * 8000L / durMs : 0;
 
-        if (!audioMode && speedMode == 0 && !triedFallback) {
-            startTransformer(it, srcW, srcH);
-            return;
-        }
-        closeIn();
         String inArg = FFmpegKitConfig.getSafParameterForRead(this, it.uri);
         if (inArg == null) {
             jobFailed(it, "Cannot open this video");
@@ -455,36 +424,61 @@ public class MainActivity extends AppCompatActivity {
                 a.add("-vf");
                 a.add(android.text.TextUtils.join(",", vf));
             }
-                String preset = speedMode == 2 ? "fast" : "veryfast";
-                if (h265) {
-                    a.add("-c:v");
-                    a.add("libx265");
-                    a.add("-crf");
-                    a.add(String.valueOf(crf + 2));
-                    a.add("-preset");
-                    a.add(preset);
-                    a.add("-tag:v");
-                    a.add("hvc1");
-                } else {
-                    a.add("-c:v");
-                    a.add("libx264");
-                    a.add("-crf");
-                    a.add(String.valueOf(crf));
-                    a.add("-preset");
-                    a.add(preset);
-                    a.add("-profile:v");
-                    a.add("high");
+            // optional "fit to size": pick the video bitrate that lands near the wanted file size
+            long abrBps = 0;
+            if (targetMB > 0) {
+                double effSec = (progressMs > 0 ? progressMs : durMs) / 1000.0;
+                if (effSec <= 0) {
+                    jobFailed(it, "Cannot read the video length - target size needs it");
+                    return;
                 }
-                a.add("-pix_fmt");
-                a.add("yuv420p");
-                // safety net: never let the picture use more bits than the original did
-                if (it.srcBps > 0) {
-                    long cap = Math.max(100_000L, (long) (it.srcBps * 0.85) - (mute ? 0 : audioBps));
-                    a.add("-maxrate");
-                    a.add(String.valueOf(cap));
-                    a.add("-bufsize");
-                    a.add(String.valueOf(cap * 2));
+                long targetBytes = (long) (targetMB * 1024 * 1024);
+                if (it.size > 0 && targetBytes >= it.size * 0.95) {
+                    it.status = "Skipped - already about " + human(it.size) + ", not bigger than the target";
+                    refresh(it);
+                    index++;
+                    startNext();
+                    return;
                 }
+                abrBps = (long) (targetBytes * 8 / effSec * 0.96) - (mute ? 0 : audioBps);   // ~4% container overhead
+                if (abrBps < 60_000) {
+                    jobFailed(it, "Target size is too small for this video length");
+                    return;
+                }
+            }
+            // x264 / x265 with constant quality (CRF) - or a bitrate when a target size is set
+            a.add("-c:v");
+            a.add(h265 ? "libx265" : "libx264");
+            if (abrBps > 0) {
+                a.add("-b:v");
+                a.add(String.valueOf(abrBps));
+                a.add("-maxrate");
+                a.add(String.valueOf(abrBps * 13 / 10));
+                a.add("-bufsize");
+                a.add(String.valueOf(abrBps * 2));
+            } else {
+                a.add("-crf");
+                a.add(String.valueOf(h265 ? crf + 2 : crf));
+            }
+            a.add("-preset");
+            a.add(preset);
+            if (h265) {
+                a.add("-tag:v");
+                a.add("hvc1");
+            } else {
+                a.add("-profile:v");
+                a.add("high");
+            }
+            a.add("-pix_fmt");
+            a.add("yuv420p");
+            // safety net: never let the picture use more bits than the original did
+            if (abrBps == 0 && it.srcBps > 0) {
+                long cap = Math.max(100_000L, (long) (it.srcBps * 0.85) - (mute ? 0 : audioBps));
+                a.add("-maxrate");
+                a.add(String.valueOf(cap));
+                a.add("-bufsize");
+                a.add(String.valueOf(cap * 2));
+            }
             if (mute) {
                 a.add("-an");
             } else {
@@ -501,7 +495,6 @@ public class MainActivity extends AppCompatActivity {
         jobProgress = 0f;
         session = FFmpegKit.executeWithArgumentsAsync(a.toArray(new String[0]),
                 done -> handler.post(() -> {
-                    closeIn();
                     if (cancelled) return;
                     if (ReturnCode.isSuccess(done.getReturnCode())) {
                         jobDone(it);
@@ -569,79 +562,7 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    /** Hardware transcode through Android's MediaCodec (Media3 Transformer). Falls back to ffmpeg on error. */
-    private void startTransformer(final Item it, int srcW, int srcH) {
-        int dispH = (rotDeg == 90 || rotDeg == 270) ? srcW : srcH;     // picture height after rotating
-        int target = dispH;
-        if (resH > 0 && dispH > 0) target = Math.min(dispH, resH);
-        double f = qIdx == 0 ? 0.8 : (qIdx == 1 ? 0.6 : 0.45);
-        long vb = it.srcBps > 0 ? Math.max(150_000L, (long) ((it.srcBps - (mute ? 0 : audioBps)) * f)) : 2_000_000L;
-        if (h265) vb = (long) (vb * 0.7);
-
-        VideoEncoderSettings vs = new VideoEncoderSettings.Builder().setBitrate((int) Math.min(vb, 50_000_000L)).build();
-        List<Effect> fx = new ArrayList<>();
-        if (rotDeg != 0) fx.add(new ScaleAndRotateTransformation.Builder().setRotationDegrees(-rotDeg).build());
-        if (target > 0) fx.add(Presentation.createForHeight(target));   // also makes sure the video is really re-encoded
-
-        MediaItem.Builder mb = new MediaItem.Builder().setUri(it.uri);
-        if (startMs > 0 || endMs > 0) {
-            MediaItem.ClippingConfiguration.Builder cb = new MediaItem.ClippingConfiguration.Builder();
-            cb.setStartPositionMs(startMs);
-            if (endMs > 0) cb.setEndPositionMs(endMs);
-            mb.setClippingConfiguration(cb.build());
-        }
-        EditedMediaItem em = new EditedMediaItem.Builder(mb.build())
-                .setRemoveAudio(mute)
-                .setEffects(new Effects(Collections.emptyList(), fx))
-                .build();
-
-        jobProgress = 0f;
-        session = null;
-        transformer = new Transformer.Builder(this)
-                .setVideoMimeType(h265 ? MimeTypes.VIDEO_H265 : MimeTypes.VIDEO_H264)
-                .setEncoderFactory(new DefaultEncoderFactory.Builder(this)
-                        .setRequestedVideoEncoderSettings(vs)
-                        .setEnableFallback(true)
-                        .build())
-                .addListener(new Transformer.Listener() {
-                    @Override
-                    public void onCompleted(Composition composition, ExportResult exportResult) {
-                        transformer = null;
-                        if (cancelled) return;
-                        jobDone(it);
-                    }
-
-                    @Override
-                    public void onError(Composition composition, ExportResult exportResult, ExportException e) {
-                        transformer = null;
-                        if (cancelled) return;
-                        // hardware path failed -> redo this file with ffmpeg (software)
-                        triedFallback = true;
-                        if (tmpOut != null) tmpOut.delete();
-                        tmpOut = new File(getCacheDir(), "out_" + System.nanoTime() + ".mp4");
-                        it.status = "Hardware failed (" + e.getErrorCodeName() + "), using software…";
-                        refresh(it);
-                        try {
-                            buildAndStart(it);
-                        } catch (Throwable t) {
-                            jobFailed(it, "Error: " + t);
-                        }
-                    }
-                })
-                .build();
-        transformer.start(em, tmpOut.getAbsolutePath());
-    }
-
-    private void closeIn() {
-        try {
-            if (inPfd != null) inPfd.close();
-        } catch (Exception ignored) {
-        }
-        inPfd = null;
-    }
-
     private void jobFailed(Item it, String msg) {
-        closeIn();
         if (tmpOut != null) tmpOut.delete();
         it.status = msg;
         refresh(it);
@@ -677,11 +598,7 @@ public class MainActivity extends AppCompatActivity {
             if (index < items.size()) {
                 Item it = items.get(index);
                 int pct = 0;
-                if (!saving && transformer != null) {
-                    ProgressHolder ph = new ProgressHolder();
-                    if (transformer.getProgress(ph) == Transformer.PROGRESS_STATE_AVAILABLE) jobProgress = ph.progress / 100f;
-                }
-                if (!saving && (session != null || transformer != null)) {
+                if (!saving && session != null) {
                     pct = Math.max(0, Math.min(99, (int) (jobProgress * 100)));
                     it.status = pct + "%";
                     refresh(it);
@@ -800,115 +717,12 @@ public class MainActivity extends AppCompatActivity {
         return String.format(Locale.US, "%.2f GB", m / 1024);
     }
 
-    // ------------------------------------------------------------- crash report
-    private File crashFile() {
-        return new File(getFilesDir(), "last_crash.txt");
-    }
-
-    /** Java crashes: save the stack trace so the next launch can show it. */
-    private void installCrashLogger() {
-        final Thread.UncaughtExceptionHandler old = Thread.getDefaultUncaughtExceptionHandler();
-        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
-            try {
-                StringWriter sw = new StringWriter();
-                e.printStackTrace(new PrintWriter(sw));
-                java.io.FileWriter fw = new java.io.FileWriter(crashFile());
-                fw.write("Java crash on thread " + t.getName() + "\n" + sw);
-                fw.close();
-            } catch (Throwable ignored) {
-            }
-            if (old != null) old.uncaughtException(t, e);
-        });
-    }
-
-    /** On launch: show the saved Java crash, or why the system says the last run died (native crash etc.). */
-    private void showLastCrash() {
-        String report = null;
-        try {
-            File f = crashFile();
-            if (f.exists()) {
-                try (FileInputStream in = new FileInputStream(f)) {
-                    ByteArrayOutputStream bo = new ByteArrayOutputStream();
-                    byte[] b = new byte[4096];
-                    int k;
-                    while ((k = in.read(b)) > 0) bo.write(b, 0, k);
-                    report = bo.toString("UTF-8");
-                }
-                f.delete();
-            }
-        } catch (Throwable ignored) {
-        }
-        if (report == null && Build.VERSION.SDK_INT >= 30) {
-            try {
-                android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
-                List<ApplicationExitInfo> l = am.getHistoricalProcessExitReasons(getPackageName(), 0, 1);
-                if (!l.isEmpty()) {
-                    ApplicationExitInfo e = l.get(0);
-                    long last = prefs.getLong("last_exit_ts", 0);
-                    int r = e.getReason();
-                    boolean bad = r == ApplicationExitInfo.REASON_CRASH_NATIVE || r == ApplicationExitInfo.REASON_CRASH
-                            || r == ApplicationExitInfo.REASON_ANR || r == ApplicationExitInfo.REASON_SIGNALED
-                            || r == ApplicationExitInfo.REASON_LOW_MEMORY || r == ApplicationExitInfo.REASON_INITIALIZATION_FAILURE;
-                    if (bad && e.getTimestamp() > last) {
-                        StringBuilder sb = new StringBuilder("Last run ended with reason code " + r
-                                + " (" + e.getDescription() + "), status " + e.getStatus() + "\n");
-                        if (r == ApplicationExitInfo.REASON_CRASH_NATIVE) {
-                            try (InputStream in = e.getTraceInputStream()) {
-                                if (in != null) {
-                                    // tombstone is binary protobuf: pull out the readable text (library names, signal)
-                                    ByteArrayOutputStream bo = new ByteArrayOutputStream();
-                                    byte[] b = new byte[4096];
-                                    int k;
-                                    while ((k = in.read(b)) > 0 && bo.size() < 400_000) bo.write(b, 0, k);
-                                    byte[] d = bo.toByteArray();
-                                    StringBuilder run = new StringBuilder();
-                                    int lines = 0;
-                                    for (int i = 0; i <= d.length && lines < 40; i++) {
-                                        int c = i < d.length ? d[i] & 0xff : 0;
-                                        if (c >= 32 && c < 127) {
-                                            run.append((char) c);
-                                        } else {
-                                            String x = run.toString();
-                                            if (x.length() >= 8 && (x.contains(".so") || x.contains("SIG") || x.contains("abort")
-                                                    || x.contains("Abort") || x.contains("ffmpeg") || x.contains("Fatal"))) {
-                                                sb.append(x).append('\n');
-                                                lines++;
-                                            }
-                                            run.setLength(0);
-                                        }
-                                    }
-                                }
-                            } catch (Throwable ignored) {
-                            }
-                        }
-                        report = sb.toString();
-                    }
-                    prefs.edit().putLong("last_exit_ts", e.getTimestamp()).apply();
-                }
-            } catch (Throwable ignored) {
-            }
-        }
-        if (report == null) return;
-        final String text = report;
-        new AlertDialog.Builder(this)
-                .setTitle("App crashed last time")
-                .setMessage(text)
-                .setPositiveButton("Copy", (d, w) -> {
-                    ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                    cm.setPrimaryClip(ClipData.newPlainText("crash", text));
-                    Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show();
-                })
-                .setNegativeButton("Close", null)
-                .show();
-    }
-
     @Override
     protected void onDestroy() {
         super.onDestroy();
         handler.removeCallbacks(tick);
         try {
             if (session != null && running) FFmpegKit.cancel(session.getSessionId());
-            if (transformer != null) transformer.cancel();
         } catch (Exception ignored) {
         }
         io.shutdown();
