@@ -8,6 +8,7 @@ import android.content.UriPermission;
 import android.database.Cursor;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -120,6 +121,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        installCrashReporter();
         setContentView(R.layout.activity_main);
 
         llFiles = findViewById(R.id.llFiles);
@@ -168,7 +170,82 @@ public class MainActivity extends AppCompatActivity {
         ((android.widget.RadioGroup) findViewById(R.id.rgMode)).setOnCheckedChangeListener(
                 (g, id) -> updateModeUi());
 
+        showLastProblem();
         handleIntent(getIntent());
+    }
+
+    // ------------------------------------------------------ crash report
+    // If the app crashes, the reason is shown in a box the next time it opens (so it can be sent for fixing).
+    private File crashFile() {
+        return new File(getFilesDir(), "crash.txt");
+    }
+
+    private void installCrashReporter() {
+        final Thread.UncaughtExceptionHandler old = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+            try {
+                java.io.StringWriter sw = new java.io.StringWriter();
+                e.printStackTrace(new java.io.PrintWriter(sw));
+                try (java.io.FileWriter fw = new java.io.FileWriter(crashFile())) {
+                    fw.write(sw.toString());
+                }
+            } catch (Exception ignored) {
+            }
+            if (old != null) old.uncaughtException(t, e);
+        });
+    }
+
+    private static String exitReasonName(int r) {
+        switch (r) {
+            case 2: return "killed by a signal";
+            case 3: return "low memory";
+            case 4: return "Java crash";
+            case 5: return "NATIVE crash (inside the ffmpeg library)";
+            case 6: return "not responding (ANR)";
+            case 7: return "failed to start";
+            case 9: return "too much resource use";
+            default: return "exit code " + r;
+        }
+    }
+
+    private void showLastProblem() {
+        String text = null;
+        File f = crashFile();
+        if (f.exists()) {
+            try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
+                StringBuilder sb = new StringBuilder();
+                String line;
+                int n = 0;
+                while ((line = br.readLine()) != null && n++ < 18) sb.append(line).append('\n');
+                text = "Java crash:\n" + sb;
+            } catch (Exception ignored) {
+            }
+            f.delete();
+        } else if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+                List<android.app.ApplicationExitInfo> l = am.getHistoricalProcessExitReasons(getPackageName(), 0, 1);
+                if (!l.isEmpty()) {
+                    android.app.ApplicationExitInfo x = l.get(0);
+                    int r = x.getReason();
+                    boolean bad = r == 2 || r == 3 || r == 4 || r == 5 || r == 6 || r == 7 || r == 9;
+                    boolean fresh = System.currentTimeMillis() - x.getTimestamp() < 10 * 60 * 1000L;
+                    boolean seen = prefs.getLong("exit_seen", 0) == x.getTimestamp();
+                    if (bad && fresh && !seen) {
+                        prefs.edit().putLong("exit_seen", x.getTimestamp()).apply();
+                        text = "Last exit: " + exitReasonName(r) + "\n" + x.getDescription();
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        if (text != null) {
+            new android.app.AlertDialog.Builder(this)
+                    .setTitle("The app stopped last time")
+                    .setMessage(text)
+                    .setPositiveButton("OK", null)
+                    .show();
+        }
     }
 
     @Override
@@ -355,8 +432,8 @@ public class MainActivity extends AppCompatActivity {
         tmpOut = new File(getCacheDir(), "out_" + System.nanoTime() + (audioMode ? ".m4a" : ".mp4"));
         try {
             buildAndStart(it);
-        } catch (Exception e) {
-            jobFailed(it, String.valueOf(e.getMessage()));
+        } catch (Throwable e) {   // includes UnsatisfiedLinkError etc. from the ffmpeg library
+            jobFailed(it, "Engine error: " + e);
         }
     }
 
